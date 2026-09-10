@@ -138,30 +138,25 @@ jobs:
           echo "$COMMIT_MESSAGES" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
 
-      # Read the version actually embedded in the built APK, not version.properties
-      # directly - some apps compute an ephemeral "preview" patch/versionCode for debug
-      # builds without persisting it, so re-deriving from version.properties here could
-      # silently drift from what's really in the APK. output-metadata.json is written
-      # by AGP alongside the APK and reflects the actual build.
+      # Read the version actually embedded in the built APK, not recomputed here -
+      # output-metadata.json is written by AGP alongside the APK and reflects the
+      # actual build. For a debug build this is whatever the calling repo's Gradle
+      # setup derives from git directly (e.g. `git describe`), not a separate
+      # persisted "build number" - there's nothing else to extract here.
       - name: Get version name
         run: |
           METADATA_FILE=$(find app/build/outputs/apk/debug -name "output-metadata.json" | head -1)
           if [ -n "$METADATA_FILE" ]; then
-            FULL_VERSION_NAME=$(jq -r '.elements[0].versionName' "$METADATA_FILE")
+            VERSION_NAME=$(jq -r '.elements[0].versionName' "$METADATA_FILE")
             VERSION_CODE=$(jq -r '.elements[0].versionCode' "$METADATA_FILE")
           else
-            FULL_VERSION_NAME="unknown"
+            VERSION_NAME="unknown"
             VERSION_CODE="unknown"
           fi
-          # FULL_VERSION_NAME may look like "v2.1.1 Build: 254" - split into the plain
-          # version name and an optional trailing build counter, if present.
-          VERSION_NAME=$(echo "$FULL_VERSION_NAME" | sed -E 's/ Build: [0-9]+$//')
-          APP_BUILD_NUMBER=$(echo "$FULL_VERSION_NAME" | grep -oE 'Build: [0-9]+' | grep -oE '[0-9]+' || echo "unknown")
 
           echo "VERSION_NAME=$VERSION_NAME" >> $GITHUB_ENV
           echo "VERSION_CODE=$VERSION_CODE" >> $GITHUB_ENV
-          echo "APP_BUILD_NUMBER=$APP_BUILD_NUMBER" >> $GITHUB_ENV
-          echo "Extracted version: $VERSION_NAME, versionCode: $VERSION_CODE, build: $APP_BUILD_NUMBER"
+          echo "Extracted version: $VERSION_NAME, versionCode: $VERSION_CODE"
 
       # Get current timestamp for release notes (IST, not the runner's default UTC)
       - name: Get current timestamp
@@ -184,7 +179,7 @@ jobs:
             ${{ env.COMMIT_MESSAGES }}
 
             📋 **Build Details:**
-            - Version: ${{ env.VERSION_NAME }}, Version Code: ${{ env.VERSION_CODE }}, Build: ${{ env.APP_BUILD_NUMBER }}
+            - Version: ${{ env.VERSION_NAME }}, Version Code: ${{ env.VERSION_CODE }}
             - Branch: ${{ github.head_ref || github.ref_name }}
             - Commit: ${{ env.COMMIT_SHA_SHORT }} - ${{ env.COMMIT_MESSAGE_SUBJECT }}
             - Workflow run: ${{ github.run_number }}
@@ -203,7 +198,7 @@ jobs:
             // Build details
             const buildInfo = `
             📋 **Build Information:**
-            - **Version:** ${{ env.VERSION_NAME }}, Version Code: ${{ env.VERSION_CODE }}, Build: ${{ env.APP_BUILD_NUMBER }}
+            - **Version:** ${{ env.VERSION_NAME }}, Version Code: ${{ env.VERSION_CODE }}
             - **Branch:** ${{ github.head_ref || github.ref_name }}
             - **Commit:** \`${{ env.COMMIT_SHA_SHORT }}\` - ${{ env.COMMIT_MESSAGE_SUBJECT }}
             - **Workflow run:** #${{ github.run_number }}
