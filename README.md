@@ -34,12 +34,95 @@ jobs:
     secrets: inherit
 ```
 
-`secrets: inherit` passes the calling repo's `FIREBASE_APP_ID` and
-`CREDENTIAL_FILE_CONTENT` secrets through automatically - `secrets: inherit` matches
-by name (case-insensitively), so the calling repo's secrets must be named exactly
-`FIREBASE_APP_ID` and `CREDENTIAL_FILE_CONTENT` (see the reusable workflow's
-`on.workflow_call.secrets` block: `firebase_app_id` / `credential_file_content`).
-See the file itself for all available inputs.
+Required secrets on the calling repo: `FIREBASE_APP_ID`, `CREDENTIAL_FILE_CONTENT`.
+
+### `android-release-play-store.yml` (reusable)
+
+Builds a signed release App Bundle + APK, creates a draft GitHub release, uploads
+the AAB to Play Store Internal Testing, uploads the release APK to Firebase App
+Distribution, and bumps the version on `develop` after a confirmed successful Play
+Store upload. Call it on push to `main`:
+
+```yaml
+name: Release to Play Store (Internal Testing)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+# No cancel-in-progress: a Play Store / Firebase upload should never be killed
+# mid-flight. This just queues a second trigger instead of letting two releases
+# run concurrently against the same track.
+concurrency:
+  group: release-play-store-${{ github.ref }}
+
+jobs:
+  release:
+    uses: aaatechnology/build-tools/.github/workflows/android-release-play-store.yml@main
+    with:
+      app_display_name: Age Calculator
+      package_name: com.arun.agecalculator
+      play_internal_testing_link: ${{ vars.PLAY_INTERNAL_TESTING_LINK }}
+    secrets: inherit
+```
+
+Required secrets on the calling repo: `ANDROID_KEYSTORE_BASE64`,
+`ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`,
+`PLAY_SERVICE_ACCOUNT_JSON`, `FIREBASE_APP_ID`, `CREDENTIAL_FILE_CONTENT`.
+`play_internal_testing_link` is optional (an org/repo variable, not a secret) -
+omit the `with:` line entirely if you don't have one, rather than passing an empty
+string.
+
+### `android-promote-production.yml` (reusable)
+
+Manually promotes the build already sitting on Play Store's Internal Testing track
+straight to Production - no rebuild, no re-upload, just a track move via the Play
+Developer API. Deliberately `workflow_dispatch`-only in every caller: a production
+rollout is irreversible-ish and user-facing, so it should always need an explicit
+human trigger, never an automatic one.
+
+```yaml
+name: Promote Internal Testing to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      rollout_percentage:
+        description: 'Percent of users to roll out to (1-100). Less than 100 starts a staged rollout.'
+        required: true
+        default: '100'
+
+# No cancel-in-progress: a production rollout should never be killed mid-flight.
+# This just queues a second trigger instead of letting two promotions race against
+# the same track.
+concurrency:
+  group: promote-to-production-${{ github.ref }}
+
+jobs:
+  promote:
+    uses: aaatechnology/build-tools/.github/workflows/android-promote-production.yml@main
+    with:
+      package_name: com.arun.agecalculator
+      rollout_percentage: ${{ inputs.rollout_percentage }}
+    secrets: inherit
+```
+
+Required secret on the calling repo: `PLAY_SERVICE_ACCOUNT_JSON`.
+
+### A note on `secrets: inherit`
+
+Every workflow above uses `secrets: inherit` to pass the calling repo's secrets
+through automatically instead of listing each one out. It matches **by name**
+(case-insensitively): a reusable workflow's `on.workflow_call.secrets` entry
+`credential_file_content` is satisfied by a caller secret named
+`CREDENTIAL_FILE_CONTENT`, `Credential_File_Content`, etc. - but nothing else. If a
+caller doesn't have a secret with a matching name at all, the call fails with
+`Secret <name> is required, but not provided while calling` (this bit us once
+already - `firebase_credential_file_content` vs. the real `CREDENTIAL_FILE_CONTENT`
+secret). When adding a new caller repo, double check its secret names against each
+reusable workflow's `on.workflow_call.secrets` block above before assuming
+`secrets: inherit` will just work.
 
 ### `artifact-housekeeping.yml`
 
