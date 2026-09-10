@@ -4,7 +4,7 @@
 # Store upload is confirmed successful - creates the git tag + draft GitHub release
 # that records the shipped version. See this repo's README for the calling pattern.
 #
-# Versioning is git-native: the next version comes from the latest "vX.Y.Z" tag plus
+# Versioning is git-native: the next version comes from the latest "X.Y.Z" tag plus
 # the release PR's declared "## Version Bump" (major/minor/patch), and versionCode is
 # the total commit count on this branch (deterministic from any commit, so it's
 # exactly reproducible later from a tag alone - see promote-to-production). There is
@@ -65,7 +65,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          # Full history + tags: computing the next version needs every "vX.Y.Z" tag
+          # Full history + tags: computing the next version needs every "X.Y.Z" tag
           # reachable, and versionCode (total commit count) needs full commit depth -
           # a shallow default checkout would silently give wrong answers for both.
           fetch-depth: 0
@@ -137,22 +137,22 @@ jobs:
 
       # Computed BEFORE building (not read back from the build afterward): the build
       # step needs the exact target version to embed in the AAB/APK, and this decides
-      # it from the latest reachable "vX.Y.Z" tag plus VERSION_BUMP (major/minor/patch,
-      # from the step above) - no tag is created yet, that only happens after a
-      # confirmed successful Play Store upload, further down.
+      # it from the latest reachable "X.Y.Z" tag (no "v" prefix) plus VERSION_BUMP
+      # (major/minor/patch, from the step above) - no tag is created yet, that only
+      # happens after a confirmed successful Play Store upload, further down.
       - name: Compute next version from git tags
         run: |
-          LATEST_TAG=$(git describe --tags --match "v[0-9]*.[0-9]*.[0-9]*" --abbrev=0 2>/dev/null || echo "")
+          LATEST_TAG=$(git describe --tags --match "[0-9]*.[0-9]*.[0-9]*" --abbrev=0 2>/dev/null || echo "")
 
           if [ -z "$LATEST_TAG" ]; then
             # No release has ever been tagged - this is the very first one, so it's
-            # v1.0.0 regardless of the declared bump type (there's nothing to bump
+            # 1.0.0 regardless of the declared bump type (there's nothing to bump
             # "from" yet).
             RELEASE_VERSION_NAME="1.0.0"
           else
-            MAJOR=$(echo "$LATEST_TAG" | sed 's/^v//' | cut -d. -f1)
-            MINOR=$(echo "$LATEST_TAG" | sed 's/^v//' | cut -d. -f2)
-            PATCH=$(echo "$LATEST_TAG" | sed 's/^v//' | cut -d. -f3)
+            MAJOR=$(echo "$LATEST_TAG" | cut -d. -f1)
+            MINOR=$(echo "$LATEST_TAG" | cut -d. -f2)
+            PATCH=$(echo "$LATEST_TAG" | cut -d. -f3)
 
             case "$VERSION_BUMP" in
               major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
@@ -164,7 +164,7 @@ jobs:
           fi
 
           echo "RELEASE_VERSION_NAME=$RELEASE_VERSION_NAME" >> $GITHUB_ENV
-          echo "RELEASE_TAG=v${RELEASE_VERSION_NAME}" >> $GITHUB_ENV
+          echo "RELEASE_TAG=${RELEASE_VERSION_NAME}" >> $GITHUB_ENV
           echo "VERSION_CODE=$(git rev-list --count HEAD)" >> $GITHUB_ENV
 
       # Builds both the AAB (for Play Store) and a signed release APK (for Firebase

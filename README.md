@@ -94,11 +94,11 @@ versionName, both overridable via `-PreleaseVersionCode`/`-PreleaseVersionName` 
 this workflow passes those explicitly for the actual release build). There's no
 `version.properties` to keep in sync across branches:
 
-- **The next version** comes from the latest reachable `vX.Y.Z` tag plus the release
+- **The next version** comes from the latest reachable `X.Y.Z` tag plus the release
   PR's declared bump type - see `## Version Bump` in `AgeCalculator`'s
   `.github/PULL_REQUEST_TEMPLATE/release.md` (`major`/`minor`/`patch`, default
   `patch`), extracted the same way `## Release Notes` is. With no tag yet at all,
-  the first release is always `v1.0.0`.
+  the first release is always `1.0.0`.
 - **versionCode** is the calling repo's total commit count (`git rev-list --count`) -
   deterministic from any commit, so `promote-to-production` can reproduce the exact
   same number later purely from a tag, without needing to persist it anywhere.
@@ -118,7 +118,7 @@ rollout is irreversible-ish and user-facing, so it should always need an explici
 human trigger, never an automatic one.
 
 Resolves the release tag to promote from `github.ref_name` when run from an explicit
-tag ref (via the "Use workflow from" picker), or from the latest reachable `vX.Y.Z`
+tag ref (via the "Use workflow from" picker), or from the latest reachable `X.Y.Z`
 tag when run from `main` directly - then recomputes that tag's versionCode via
 `git rev-list --count <tag>`, reproducing exactly what was used when that release was
 built. Also needs `fetch-depth: 0` (already set) for the same reason as above.
