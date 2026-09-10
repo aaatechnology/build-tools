@@ -87,19 +87,6 @@ Required secrets on the calling repo: `ANDROID_KEYSTORE_BASE64`,
 omit the `with:` line entirely if you don't have one, rather than passing an empty
 string.
 
-**Choosing a major/minor/patch bump without a manual trigger**: the release PR
-(develop → main) declares it directly in its body, under a `## Version Bump`
-section - `major`, `minor`, or `patch` (default, used for anything blank/
-unrecognized too). This workflow extracts that section the same way it extracts
-`## Release Notes`, and passes the corresponding `-PmajorVersion`/`-PminorVersion`
-flag to the release build - the calling repo's `AppProperty`-based versioning
-already understands these flags (they previously only ever got passed by running
-Gradle locally by hand). Patch needs no flag: it relies on the "Bump version on
-develop" step (below) having already advanced develop one patch past the last
-release, so the next release-tagged PR merge just ships that value as-is. See
-`AgeCalculator`'s `.github/PULL_REQUEST_TEMPLATE/release.md` for the exact section
-format expected.
-
 ### `android-promote-production.yml` (reusable)
 
 Manually promotes the build already sitting on Play Store's Internal Testing track
