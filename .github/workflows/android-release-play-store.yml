@@ -84,16 +84,11 @@ jobs:
       - name: Run gradle tests
         run: ./gradlew testDebugUnitTest
 
-      # Builds both the AAB (for Play Store) and a signed release APK (for Firebase
-      # App Distribution) in one invocation - same signing config, same version stamp.
-      - name: Build release App Bundle and APK
-        run: ./gradlew bundleRelease assembleRelease
-
       # Looks up the PR associated with this commit (main only ever moves via merged
-      # PRs) and pulls just its "## Release Notes" section - not Summary/Test plan/etc.
-      # Falls back to the commit subject if no PR is found (workflow_dispatch, or a
-      # direct push) or the section was left empty.
-      - name: Extract release notes from the merged PR
+      # PRs) and pulls its "## Release Notes" and "## Version Bump" sections. Falls
+      # back to the commit subject / patch for release notes / bump type if no PR is
+      # found (workflow_dispatch, or a direct push) or a section was left empty.
+      - name: Extract release notes and version bump from the merged PR
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -113,10 +108,48 @@ jobs:
             NOTES=$(git log -1 --pretty=%s)
           fi
 
+          # "major"/"minor" trigger a real bump during the build step below; anything
+          # else (missing, "patch", a typo) is treated as patch - which needs no flag,
+          # since develop is already sitting one patch ahead from the previous
+          # release's "Bump version on develop" step.
+          VERSION_BUMP=""
+          if [ -n "$PR_BODY" ]; then
+            VERSION_BUMP=$(printf '%s\n' "$PR_BODY" \
+              | awk '/^## Version Bump/{flag=1; next} /^## /{flag=0} flag' \
+              | sed '/<!--/,/-->/d' \
+              | tr -d '[:space:]')
+          fi
+          BUMP_FLAG=""
+          case "$VERSION_BUMP" in
+            major) BUMP_FLAG="-PmajorVersion" ;;
+            minor) BUMP_FLAG="-PminorVersion" ;;
+          esac
+
           echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_ENV
           echo "RELEASE_NOTES<<EOF" >> $GITHUB_ENV
           echo "$NOTES" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
+          echo "BUMP_FLAG=$BUMP_FLAG" >> $GITHUB_ENV
+          echo "Version bump requested: ${VERSION_BUMP:-patch (default)}"
+
+      # Captured before the build step (which may bump and persist version.properties
+      # itself, per BUMP_FLAG) so "Bump version on develop" below can tell whether
+      # develop moved on independently while this release was in flight, regardless
+      # of what kind of bump just happened.
+      - name: Capture pre-build version
+        run: |
+          echo "PRE_MAJOR=$(grep "VERSION_MAJOR" version.properties | cut -d'=' -f2)" >> $GITHUB_ENV
+          echo "PRE_MINOR=$(grep "VERSION_MINOR" version.properties | cut -d'=' -f2)" >> $GITHUB_ENV
+          echo "PRE_PATCH=$(grep "VERSION_PATCH" version.properties | cut -d'=' -f2)" >> $GITHUB_ENV
+          echo "PRE_NUMBER=$(grep "VERSION_NUMBER" version.properties | cut -d'=' -f2)" >> $GITHUB_ENV
+
+      # Builds both the AAB (for Play Store) and a signed release APK (for Firebase
+      # App Distribution) in one invocation - same signing config, same version stamp.
+      # BUMP_FLAG (set above) makes this the one build that actually persists a
+      # major/minor bump to version.properties, via AppProperty - no local Gradle run
+      # or pre-merge commit needed.
+      - name: Build release App Bundle and APK
+        run: ./gradlew bundleRelease assembleRelease $BUMP_FLAG
 
       - name: Determine release tag from version.properties
         run: |
@@ -239,11 +272,15 @@ jobs:
 
       # Only runs once the upload is confirmed successful - a failed upload leaves
       # this version unused, so it should be retried as-is next time, not burned here.
-      # VERSION_PATCH and VERSION_NUMBER are gated independently, each against its own
-      # just-released value - if develop has already moved on for either one (e.g. other
-      # feature work landed its own version.properties change while this release was
-      # still building/uploading), that field is left untouched rather than clobbered,
-      # even if the other field is still safe to bump.
+      # Sets develop to one patch past whatever was just released (carrying forward
+      # RELEASED_MAJOR/MINOR too, since a major/minor release changes those). Compared
+      # against the PRE-build snapshot, not the just-released values: those two are
+      # often intentionally different now (a major/minor release changes them by
+      # design), so comparing against the released values would almost always look
+      # like "develop moved on" and skip updating it. Comparing against the pre-build
+      # snapshot instead still catches the real hazard this guards against - some
+      # other change landing on develop while this release was in flight - without
+      # false-positiving on the bump we just made ourselves.
       - name: Bump version on develop
         if: steps.play_upload.outcome == 'success'
         env:
@@ -256,30 +293,21 @@ jobs:
           CURRENT_DEVELOP_MINOR=$(grep "VERSION_MINOR" version.properties | cut -d'=' -f2)
           CURRENT_DEVELOP_PATCH=$(grep "VERSION_PATCH" version.properties | cut -d'=' -f2)
           CURRENT_DEVELOP_NUMBER=$(grep "VERSION_NUMBER" version.properties | cut -d'=' -f2)
-          CHANGED=false
 
-          if [ "$CURRENT_DEVELOP_MAJOR" = "$RELEASED_MAJOR" ] && [ "$CURRENT_DEVELOP_MINOR" = "$RELEASED_MINOR" ] && [ "$CURRENT_DEVELOP_PATCH" = "$RELEASED_PATCH" ]; then
-            NEXT_VERSION_PATCH=$((CURRENT_DEVELOP_PATCH + 1))
+          if [ "$CURRENT_DEVELOP_MAJOR" = "$PRE_MAJOR" ] && [ "$CURRENT_DEVELOP_MINOR" = "$PRE_MINOR" ] && \
+             [ "$CURRENT_DEVELOP_PATCH" = "$PRE_PATCH" ] && [ "$CURRENT_DEVELOP_NUMBER" = "$PRE_NUMBER" ]; then
+            NEXT_VERSION_PATCH=$((RELEASED_PATCH + 1))
+            NEXT_VERSION_NUMBER=$((VERSION_CODE + 1))
+            sed -i "s/^VERSION_MAJOR=.*/VERSION_MAJOR=${RELEASED_MAJOR}/" version.properties
+            sed -i "s/^VERSION_MINOR=.*/VERSION_MINOR=${RELEASED_MINOR}/" version.properties
             sed -i "s/^VERSION_PATCH=.*/VERSION_PATCH=${NEXT_VERSION_PATCH}/" version.properties
-            CHANGED=true
-          else
-            echo "develop's version (${CURRENT_DEVELOP_MAJOR}.${CURRENT_DEVELOP_MINOR}.${CURRENT_DEVELOP_PATCH}) already differs from the just-released ${RELEASED_MAJOR}.${RELEASED_MINOR}.${RELEASED_PATCH} - leaving VERSION_PATCH as-is."
-          fi
-
-          if [ "$CURRENT_DEVELOP_NUMBER" = "$VERSION_CODE" ]; then
-            NEXT_VERSION_NUMBER=$((CURRENT_DEVELOP_NUMBER + 1))
             sed -i "s/^VERSION_NUMBER=.*/VERSION_NUMBER=${NEXT_VERSION_NUMBER}/" version.properties
-            CHANGED=true
-          else
-            echo "develop's versionCode (${CURRENT_DEVELOP_NUMBER}) already differs from the just-released ${VERSION_CODE} - leaving VERSION_NUMBER as-is."
-          fi
 
-          if [ "$CHANGED" = "true" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add version.properties
             git commit -m "Bump version on develop after releasing ${RELEASE_TAG}"
             git push origin HEAD:develop
           else
-            echo "Neither field was safe to bump - nothing to commit."
+            echo "develop's version (${CURRENT_DEVELOP_MAJOR}.${CURRENT_DEVELOP_MINOR}.${CURRENT_DEVELOP_PATCH} #${CURRENT_DEVELOP_NUMBER}) already differs from what this release started from (${PRE_MAJOR}.${PRE_MINOR}.${PRE_PATCH} #${PRE_NUMBER}) - some other change landed on develop while this release was in flight. Leaving it untouched rather than clobbering that work."
           fi
