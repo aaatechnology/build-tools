@@ -1,0 +1,224 @@
+# Reusable CI workflow shared across aaatechnology Android app repos: builds the
+# debug APK, runs unit tests + Jacoco coverage, and distributes the APK via Firebase
+# App Distribution. Each app repo's own workflow just calls this one with its
+# app-specific inputs/secrets - see AgeCalculator's .github/workflows/android-apk-generation.yml
+# for the calling pattern.
+#
+# Extracted after the same storage-quota bug (a GitHub Actions artifact upload with no
+# consumer, blocking every PR check) was found independently copy-pasted across six
+# app repos - fixing it once here means it can't drift out of sync per-repo again.
+
+name: Android Debug CI (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      app_display_name:
+        description: 'Display name used in Firebase release notes and PR comments (e.g. "Age Calculator")'
+        required: true
+        type: string
+      firebase_testers_group:
+        description: 'Firebase App Distribution tester group to distribute debug builds to'
+        required: false
+        type: string
+        default: 'android-testers'
+      java_version:
+        description: 'JDK version to build with'
+        required: false
+        type: string
+        default: '17'
+    secrets:
+      firebase_app_id:
+        required: true
+      firebase_credential_file_content:
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history so "git log" below can see real commits, not just the
+          # synthetic PR merge commit that a shallow (depth-1) checkout leaves behind.
+          fetch-depth: 0
+
+      - name: Set Up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu' # See 'Supported distributions' for available options
+          java-version: ${{ inputs.java_version }}
+          cache: 'gradle'
+
+      - name: Change wrapper permissions
+        run: chmod +x ./gradlew
+
+      # Run Tests Build + unit-test-only Jacoco coverage report (no device needed),
+      # and assemble the debug APK - combined into one invocation to avoid paying
+      # Gradle daemon startup/configuration twice.
+      - name: Run gradle tests and build debug APK
+        run: ./gradlew jacocoTestReportUnitOnly assembleDebug
+
+      - name: Parse unit test coverage
+        run: |
+          REPORT="app/build/reports/jacoco/jacocoTestReportUnitOnly/jacocoTestReportUnitOnly.xml"
+          if [ -f "$REPORT" ]; then
+            LINE_COUNTER=$(grep -o '<counter type="LINE"[^/]*/>' "$REPORT" | tail -1)
+            MISSED=$(echo "$LINE_COUNTER" | grep -oE 'missed="[0-9]+"' | grep -oE '[0-9]+')
+            COVERED=$(echo "$LINE_COUNTER" | grep -oE 'covered="[0-9]+"' | grep -oE '[0-9]+')
+            TOTAL=$((MISSED + COVERED))
+            if [ "$TOTAL" -gt 0 ]; then
+              COVERAGE_PCT=$(awk "BEGIN { printf \"%.1f\", ($COVERED / $TOTAL) * 100 }")
+            else
+              COVERAGE_PCT="0.0"
+            fi
+            echo "COVERAGE_SUMMARY=${COVERAGE_PCT}% lines covered (${COVERED}/${TOTAL})" >> $GITHUB_ENV
+          else
+            echo "COVERAGE_SUMMARY=unavailable (report not found)" >> $GITHUB_ENV
+          fi
+
+      # Get the APK file name dynamically
+      - name: Get APK file name
+        run: |
+          APK_FILE=$(find app/build/outputs/apk/debug -name "*.apk" | head -1)
+          echo "APK_FILE=$APK_FILE" >> $GITHUB_ENV
+          echo "Found APK: $APK_FILE"
+
+      # Resolve the actual head commit (github.sha is the synthetic merge commit on
+      # pull_request events, not the real PR head) and its short hash + subject line.
+      - name: Get commit message
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            COMMIT_SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            COMMIT_SHA="${{ github.sha }}"
+          fi
+          COMMIT_SHA_SHORT=$(git rev-parse --short "$COMMIT_SHA" 2>/dev/null || echo "${COMMIT_SHA:0:7}")
+          COMMIT_MESSAGE_SUBJECT=$(git log -1 --pretty=%s "$COMMIT_SHA" 2>/dev/null || echo "")
+          if [ -z "$COMMIT_MESSAGE_SUBJECT" ]; then
+            COMMIT_MESSAGE_SUBJECT="(commit message unavailable)"
+          fi
+          echo "COMMIT_SHA=$COMMIT_SHA" >> $GITHUB_ENV
+          echo "COMMIT_SHA_SHORT=$COMMIT_SHA_SHORT" >> $GITHUB_ENV
+          echo "COMMIT_MESSAGE_SUBJECT=$COMMIT_MESSAGE_SUBJECT" >> $GITHUB_ENV
+
+      # Recent Changes: for a PR, only the commits this PR actually introduces
+      # (base..head) - not the target branch's whole history. For a direct push
+      # (e.g. after a merge), fall back to the last 10 non-merge commits from HEAD.
+      - name: Generate release notes from commits
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            COMMIT_MESSAGES=$(git log ${{ github.event.pull_request.base.sha }}..${{ env.COMMIT_SHA }} --no-merges --pretty=format:"• %s" 2>/dev/null || echo "")
+          else
+            COMMIT_MESSAGES=$(git log -10 --no-merges --pretty=format:"• %s" 2>/dev/null || echo "")
+          fi
+
+          if [ -z "$COMMIT_MESSAGES" ]; then
+            COMMIT_MESSAGES="• Latest development build"
+          fi
+
+          echo "COMMIT_MESSAGES<<EOF" >> $GITHUB_ENV
+          echo "$COMMIT_MESSAGES" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      # Read the version actually embedded in the built APK, not version.properties
+      # directly - some apps compute an ephemeral "preview" patch/versionCode for debug
+      # builds without persisting it, so re-deriving from version.properties here could
+      # silently drift from what's really in the APK. output-metadata.json is written
+      # by AGP alongside the APK and reflects the actual build.
+      - name: Get version name
+        run: |
+          METADATA_FILE=$(find app/build/outputs/apk/debug -name "output-metadata.json" | head -1)
+          if [ -n "$METADATA_FILE" ]; then
+            FULL_VERSION_NAME=$(jq -r '.elements[0].versionName' "$METADATA_FILE")
+            VERSION_CODE=$(jq -r '.elements[0].versionCode' "$METADATA_FILE")
+          else
+            FULL_VERSION_NAME="unknown"
+            VERSION_CODE="unknown"
+          fi
+          # FULL_VERSION_NAME may look like "v2.1.1 Build: 254" - split into the plain
+          # version name and an optional trailing build counter, if present.
+          VERSION_NAME=$(echo "$FULL_VERSION_NAME" | sed -E 's/ Build: [0-9]+$//')
+          APP_BUILD_NUMBER=$(echo "$FULL_VERSION_NAME" | grep -oE 'Build: [0-9]+' | grep -oE '[0-9]+' || echo "unknown")
+
+          echo "VERSION_NAME=$VERSION_NAME" >> $GITHUB_ENV
+          echo "VERSION_CODE=$VERSION_CODE" >> $GITHUB_ENV
+          echo "APP_BUILD_NUMBER=$APP_BUILD_NUMBER" >> $GITHUB_ENV
+          echo "Extracted version: $VERSION_NAME, versionCode: $VERSION_CODE, build: $APP_BUILD_NUMBER"
+
+      # Get current timestamp for release notes (IST, not the runner's default UTC)
+      - name: Get current timestamp
+        run: |
+          CURRENT_DATE=$(TZ='Asia/Kolkata' date +'%Y-%m-%d %H:%M:%S IST')
+          echo "CURRENT_DATE=$CURRENT_DATE" >> $GITHUB_ENV
+
+      - name: Upload Artifact to Firebase App Distribution
+        id: firebase_distribution
+        uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ secrets.firebase_app_id }}
+          serviceCredentialsFileContent: ${{ secrets.firebase_credential_file_content }}
+          groups: ${{ inputs.firebase_testers_group }}
+          file: ${{ env.APK_FILE }}
+          releaseNotes: |
+            🚀 ${{ inputs.app_display_name }} ${{ env.VERSION_NAME }} (Debug)
+
+            📱 **Recent Changes:**
+            ${{ env.COMMIT_MESSAGES }}
+
+            📋 **Build Details:**
+            - Version: ${{ env.VERSION_NAME }}, Version Code: ${{ env.VERSION_CODE }}, Build: ${{ env.APP_BUILD_NUMBER }}
+            - Branch: ${{ github.head_ref || github.ref_name }}
+            - Commit: ${{ env.COMMIT_SHA_SHORT }} - ${{ env.COMMIT_MESSAGE_SUBJECT }}
+            - Workflow run: ${{ github.run_number }}
+            - Date: ${{ env.CURRENT_DATE }}
+            - Unit test coverage: ${{ env.COVERAGE_SUMMARY }}
+
+      # Post APK and Firebase links as PR comment
+      - name: Post links to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            // Firebase App Distribution link (generic link to console)
+            const firebaseLink = `🔥 **Firebase Distribution:** [Test on Firebase](https://appdistribution.firebase.google.com)`;
+
+            // Build details
+            const buildInfo = `
+            📋 **Build Information:**
+            - **Version:** ${{ env.VERSION_NAME }}, Version Code: ${{ env.VERSION_CODE }}, Build: ${{ env.APP_BUILD_NUMBER }}
+            - **Branch:** ${{ github.head_ref || github.ref_name }}
+            - **Commit:** \`${{ env.COMMIT_SHA_SHORT }}\` - ${{ env.COMMIT_MESSAGE_SUBJECT }}
+            - **Workflow run:** #${{ github.run_number }}
+            - **Date:** ${{ env.CURRENT_DATE }}
+            - **Unit test coverage:** ${{ env.COVERAGE_SUMMARY }}
+            `;
+
+            // Recent changes
+            const changes = `
+            📝 **Recent Changes:**
+            ${{ env.COMMIT_MESSAGES }}
+            `;
+
+            // Combine all information
+            const comment = `## 🚀 ${{ inputs.app_display_name }} Debug Build Ready
+
+            ${firebaseLink}
+
+            ${buildInfo}
+
+            ${changes}
+
+            ---
+            *This build was automatically generated by GitHub Actions*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });

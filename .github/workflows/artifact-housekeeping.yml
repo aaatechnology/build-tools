@@ -1,0 +1,78 @@
+# Scheduled account-wide cleanup for GitHub Actions artifact storage.
+#
+# Context: the aaatechnology account's private-repo Actions storage quota was
+# exhausted by artifacts quietly accumulating across six Android app repos, which
+# blocked every PR check with "Artifact storage quota has been hit" until manually
+# found and deleted by hand (see AgeCalculator PR #6). This automates that cleanup so
+# it never re-accumulates silently again.
+#
+# Requires a secret named ARTIFACT_CLEANUP_TOKEN on this repo: a personal access
+# token (classic, `repo` scope; or fine-grained with "Actions: read and write" on the
+# target repos) belonging to an account with access to every repo in REPOS below.
+# The default GITHUB_TOKEN only has access to this repo, not the others.
+
+name: Artifact Housekeeping
+
+on:
+  schedule:
+    # Daily at 03:00 UTC (08:30 IST) - well outside typical working hours.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      max_age_days:
+        description: 'Delete artifacts older than this many days'
+        required: true
+        default: '3'
+
+env:
+  REPOS: >-
+    AgeCalculator
+    IFSC
+    Astrology
+    financial-calculator
+    Vault
+    Flashlight
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete artifacts older than max_age_days across all repos
+        env:
+          GH_TOKEN: ${{ secrets.ARTIFACT_CLEANUP_TOKEN }}
+          MAX_AGE_DAYS: ${{ inputs.max_age_days || '3' }}
+        run: |
+          set -euo pipefail
+          CUTOFF_EPOCH=$(( $(date -u +%s) - MAX_AGE_DAYS * 86400 ))
+          TOTAL_DELETED=0
+          TOTAL_BYTES=0
+
+          for repo in $REPOS; do
+            echo "== $repo =="
+            REPO_DELETED=0
+            REPO_BYTES=0
+
+            gh api "repos/aaatechnology/$repo/actions/artifacts" --paginate \
+                -q '.artifacts[] | [.id, .size_in_bytes, .created_at] | @tsv' \
+              | while IFS=$'\t' read -r id size created_at; do
+                  created_epoch=$(date -u -d "$created_at" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$created_at" +%s)
+                  if [ "$created_epoch" -lt "$CUTOFF_EPOCH" ]; then
+                    echo "  deleting artifact $id (created $created_at, ${size} bytes)"
+                    gh api -X DELETE "repos/aaatechnology/$repo/actions/artifacts/$id"
+                    echo "$size"
+                  fi
+                done > /tmp/deleted_sizes.txt || true
+
+            if [ -s /tmp/deleted_sizes.txt ]; then
+              REPO_DELETED=$(wc -l < /tmp/deleted_sizes.txt | tr -d ' ')
+              REPO_BYTES=$(awk '{s+=$1} END {print s+0}' /tmp/deleted_sizes.txt)
+            fi
+            rm -f /tmp/deleted_sizes.txt
+
+            echo "  $repo: deleted $REPO_DELETED artifact(s), $REPO_BYTES bytes"
+            TOTAL_DELETED=$((TOTAL_DELETED + REPO_DELETED))
+            TOTAL_BYTES=$((TOTAL_BYTES + REPO_BYTES))
+          done
+
+          echo "## Artifact Housekeeping Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "Deleted $TOTAL_DELETED artifact(s) totaling $TOTAL_BYTES bytes across: $REPOS" >> "$GITHUB_STEP_SUMMARY"
