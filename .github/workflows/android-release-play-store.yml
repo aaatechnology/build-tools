@@ -1,8 +1,15 @@
 # Reusable release workflow shared across aaatechnology Android app repos: builds a
-# signed release App Bundle + APK, creates a draft GitHub release, uploads the AAB to
-# Play Store Internal Testing, uploads the release APK to Firebase App Distribution,
-# and bumps the version on develop after a confirmed successful Play Store upload.
-# See this repo's README for the calling pattern.
+# signed release App Bundle + APK, uploads the AAB to Play Store Internal Testing,
+# uploads the release APK to Firebase App Distribution, and - only once that Play
+# Store upload is confirmed successful - creates the git tag + draft GitHub release
+# that records the shipped version. See this repo's README for the calling pattern.
+#
+# Versioning is git-native: the next version comes from the latest "vX.Y.Z" tag plus
+# the release PR's declared "## Version Bump" (major/minor/patch), and versionCode is
+# the total commit count on this branch (deterministic from any commit, so it's
+# exactly reproducible later from a tag alone - see promote-to-production). There is
+# no version file to keep in sync across branches: any branch can always ask "what's
+# the latest tag" and compute forward from there.
 
 name: Android Release to Play Store (reusable)
 
@@ -57,6 +64,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Full history + tags: computing the next version needs every "vX.Y.Z" tag
+          # reachable, and versionCode (total commit count) needs full commit depth -
+          # a shallow default checkout would silently give wrong answers for both.
+          fetch-depth: 0
 
       - name: Set Up JDK
         uses: actions/setup-java@v5
@@ -84,16 +96,11 @@ jobs:
       - name: Run gradle tests
         run: ./gradlew testDebugUnitTest
 
-      # Builds both the AAB (for Play Store) and a signed release APK (for Firebase
-      # App Distribution) in one invocation - same signing config, same version stamp.
-      - name: Build release App Bundle and APK
-        run: ./gradlew bundleRelease assembleRelease
-
       # Looks up the PR associated with this commit (main only ever moves via merged
-      # PRs) and pulls just its "## Release Notes" section - not Summary/Test plan/etc.
-      # Falls back to the commit subject if no PR is found (workflow_dispatch, or a
-      # direct push) or the section was left empty.
-      - name: Extract release notes from the merged PR
+      # PRs) and pulls its "## Release Notes" and "## Version Bump" sections. Falls
+      # back to the commit subject / patch for release notes / bump type if no PR is
+      # found (workflow_dispatch, or a direct push) or a section was left empty.
+      - name: Extract release notes and version bump from the merged PR
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -113,45 +120,60 @@ jobs:
             NOTES=$(git log -1 --pretty=%s)
           fi
 
+          VERSION_BUMP=""
+          if [ -n "$PR_BODY" ]; then
+            VERSION_BUMP=$(printf '%s\n' "$PR_BODY" \
+              | awk '/^## Version Bump/{flag=1; next} /^## /{flag=0} flag' \
+              | sed '/<!--/,/-->/d' \
+              | tr -d '[:space:]')
+          fi
+
           echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_ENV
           echo "RELEASE_NOTES<<EOF" >> $GITHUB_ENV
           echo "$NOTES" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
+          echo "VERSION_BUMP=$VERSION_BUMP" >> $GITHUB_ENV
+          echo "Version bump requested: ${VERSION_BUMP:-patch (default)}"
 
-      - name: Determine release tag from version.properties
+      # Computed BEFORE building (not read back from the build afterward): the build
+      # step needs the exact target version to embed in the AAB/APK, and this decides
+      # it from the latest reachable "vX.Y.Z" tag plus VERSION_BUMP (major/minor/patch,
+      # from the step above) - no tag is created yet, that only happens after a
+      # confirmed successful Play Store upload, further down.
+      - name: Compute next version from git tags
         run: |
-          VERSION_MAJOR=$(grep "VERSION_MAJOR" version.properties | cut -d'=' -f2)
-          VERSION_MINOR=$(grep "VERSION_MINOR" version.properties | cut -d'=' -f2)
-          VERSION_PATCH=$(grep "VERSION_PATCH" version.properties | cut -d'=' -f2)
-          VERSION_NUMBER=$(grep "VERSION_NUMBER" version.properties | cut -d'=' -f2)
-          echo "RELEASE_TAG=v${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}" >> $GITHUB_ENV
-          echo "VERSION_CODE=$VERSION_NUMBER" >> $GITHUB_ENV
-          echo "RELEASED_MAJOR=$VERSION_MAJOR" >> $GITHUB_ENV
-          echo "RELEASED_MINOR=$VERSION_MINOR" >> $GITHUB_ENV
-          echo "RELEASED_PATCH=$VERSION_PATCH" >> $GITHUB_ENV
+          LATEST_TAG=$(git describe --tags --match "v[0-9]*.[0-9]*.[0-9]*" --abbrev=0 2>/dev/null || echo "")
 
-      # Draft, not published - review and publish it yourself once you're happy.
-      # Safe to re-run: skips creation if a release for this tag already exists
-      # (e.g. re-running workflow_dispatch without bumping version.properties).
-      - name: Create draft GitHub release
-        id: gh_release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "Release $RELEASE_TAG already exists, skipping creation."
-            echo "created=false" >> "$GITHUB_OUTPUT"
+          if [ -z "$LATEST_TAG" ]; then
+            # No release has ever been tagged - this is the very first one, so it's
+            # v1.0.0 regardless of the declared bump type (there's nothing to bump
+            # "from" yet).
+            RELEASE_VERSION_NAME="1.0.0"
           else
-            gh release create "$RELEASE_TAG" \
-              --repo "${{ github.repository }}" \
-              --target "${{ github.sha }}" \
-              --draft \
-              --title "$RELEASE_TAG" \
-              --notes "$RELEASE_NOTES" \
-              app/build/outputs/bundle/release/app-release.aab \
-              app/build/outputs/mapping/release/mapping.txt
-            echo "created=true" >> "$GITHUB_OUTPUT"
+            MAJOR=$(echo "$LATEST_TAG" | sed 's/^v//' | cut -d. -f1)
+            MINOR=$(echo "$LATEST_TAG" | sed 's/^v//' | cut -d. -f2)
+            PATCH=$(echo "$LATEST_TAG" | sed 's/^v//' | cut -d. -f3)
+
+            case "$VERSION_BUMP" in
+              major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+              minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+              *)     PATCH=$((PATCH + 1)) ;;
+            esac
+
+            RELEASE_VERSION_NAME="${MAJOR}.${MINOR}.${PATCH}"
           fi
+
+          echo "RELEASE_VERSION_NAME=$RELEASE_VERSION_NAME" >> $GITHUB_ENV
+          echo "RELEASE_TAG=v${RELEASE_VERSION_NAME}" >> $GITHUB_ENV
+          echo "VERSION_CODE=$(git rev-list --count HEAD)" >> $GITHUB_ENV
+
+      # Builds both the AAB (for Play Store) and a signed release APK (for Firebase
+      # App Distribution) in one invocation - same signing config, same version stamp.
+      # The explicit -P flags are what make app/build.gradle.kts embed the version
+      # computed above, instead of deriving one itself from git (which it only does
+      # for non-release builds - see that file for the full mechanism).
+      - name: Build release App Bundle and APK
+        run: ./gradlew bundleRelease assembleRelease -PreleaseVersionName=$RELEASE_VERSION_NAME -PreleaseVersionCode=$VERSION_CODE
 
       # Play Store "what's new" text is capped at 500 characters per locale, and
       # upload-google-play reads it from a whatsnew-<locale> file in a directory.
@@ -171,6 +193,29 @@ jobs:
           track: internal
           status: completed
           whatsNewDirectory: whatsnew
+
+      # Only runs once the upload is confirmed successful - a failed upload leaves no
+      # tag and no draft release behind at all, so the next attempt just recomputes
+      # this same next version fresh, with nothing to clean up first. Safe to re-run:
+      # skips creation if a release for this tag already exists.
+      - name: Create git tag and draft GitHub release
+        id: gh_release
+        if: steps.play_upload.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists, skipping creation."
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "${{ github.repository }}" \
+              --target "${{ github.sha }}" \
+              --draft \
+              --title "$RELEASE_TAG" \
+              --notes "$RELEASE_NOTES" \
+              app/build/outputs/bundle/release/app-release.aab \
+              app/build/outputs/mapping/release/mapping.txt
+          fi
 
       # Play Store Internal Testing can take a while to propagate to testers' devices.
       # Firebase App Distribution installs instantly, so testers can get the real signed
@@ -211,9 +256,11 @@ jobs:
           if [ "${{ steps.play_upload.outcome }}" = "success" ]; then
             PLAY_STATUS="✅ Uploaded to Play Store Internal Testing"
             TESTING_LINK="${{ inputs.play_internal_testing_link != '' && format('🔗 **Test it:** {0}', inputs.play_internal_testing_link) || '' }}"
+            RELEASE_LINK="📦 **GitHub release (draft):** ${{ github.server_url }}/${{ github.repository }}/releases/tag/$RELEASE_TAG"
           else
             PLAY_STATUS="❌ Play Store upload failed - check the workflow run"
             TESTING_LINK=""
+            RELEASE_LINK=""
           fi
           if [ "${{ steps.firebase_release_distribution.outcome }}" = "success" ]; then
             FIREBASE_STATUS="✅ Release build (signed APK) uploaded to Firebase App Distribution - installs instantly, no need to wait on Play Store propagation"
@@ -224,7 +271,7 @@ jobs:
           ## 🚀 Release $RELEASE_TAG
 
           **Version:** $RELEASE_TAG, Version Code: $VERSION_CODE
-          📦 **GitHub release (draft):** ${{ github.server_url }}/${{ github.repository }}/releases/tag/$RELEASE_TAG
+          $RELEASE_LINK
           $PLAY_STATUS
           $TESTING_LINK
           🔥 **Firebase:** $FIREBASE_STATUS
@@ -236,50 +283,3 @@ jobs:
           *Generated by the Release to Play Store workflow.*
           COMMENT
           )"
-
-      # Only runs once the upload is confirmed successful - a failed upload leaves
-      # this version unused, so it should be retried as-is next time, not burned here.
-      # VERSION_PATCH and VERSION_NUMBER are gated independently, each against its own
-      # just-released value - if develop has already moved on for either one (e.g. other
-      # feature work landed its own version.properties change while this release was
-      # still building/uploading), that field is left untouched rather than clobbered,
-      # even if the other field is still safe to bump.
-      - name: Bump version on develop
-        if: steps.play_upload.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          git fetch origin develop
-          git checkout -B develop origin/develop
-
-          CURRENT_DEVELOP_MAJOR=$(grep "VERSION_MAJOR" version.properties | cut -d'=' -f2)
-          CURRENT_DEVELOP_MINOR=$(grep "VERSION_MINOR" version.properties | cut -d'=' -f2)
-          CURRENT_DEVELOP_PATCH=$(grep "VERSION_PATCH" version.properties | cut -d'=' -f2)
-          CURRENT_DEVELOP_NUMBER=$(grep "VERSION_NUMBER" version.properties | cut -d'=' -f2)
-          CHANGED=false
-
-          if [ "$CURRENT_DEVELOP_MAJOR" = "$RELEASED_MAJOR" ] && [ "$CURRENT_DEVELOP_MINOR" = "$RELEASED_MINOR" ] && [ "$CURRENT_DEVELOP_PATCH" = "$RELEASED_PATCH" ]; then
-            NEXT_VERSION_PATCH=$((CURRENT_DEVELOP_PATCH + 1))
-            sed -i "s/^VERSION_PATCH=.*/VERSION_PATCH=${NEXT_VERSION_PATCH}/" version.properties
-            CHANGED=true
-          else
-            echo "develop's version (${CURRENT_DEVELOP_MAJOR}.${CURRENT_DEVELOP_MINOR}.${CURRENT_DEVELOP_PATCH}) already differs from the just-released ${RELEASED_MAJOR}.${RELEASED_MINOR}.${RELEASED_PATCH} - leaving VERSION_PATCH as-is."
-          fi
-
-          if [ "$CURRENT_DEVELOP_NUMBER" = "$VERSION_CODE" ]; then
-            NEXT_VERSION_NUMBER=$((CURRENT_DEVELOP_NUMBER + 1))
-            sed -i "s/^VERSION_NUMBER=.*/VERSION_NUMBER=${NEXT_VERSION_NUMBER}/" version.properties
-            CHANGED=true
-          else
-            echo "develop's versionCode (${CURRENT_DEVELOP_NUMBER}) already differs from the just-released ${VERSION_CODE} - leaving VERSION_NUMBER as-is."
-          fi
-
-          if [ "$CHANGED" = "true" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add version.properties
-            git commit -m "Bump version on develop after releasing ${RELEASE_TAG}"
-            git push origin HEAD:develop
-          else
-            echo "Neither field was safe to bump - nothing to commit."
-          fi

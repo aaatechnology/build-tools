@@ -29,18 +29,24 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Full history + tags: resolving "the latest release" (when not run from an
+          # explicit tag ref) and computing its versionCode both need full depth.
+          fetch-depth: 0
 
+      # versionCode is recomputed here, not read from anywhere: it's a deterministic
+      # function of a commit (total commit count reachable from it), so computing it
+      # against RELEASE_TAG's commit reproduces the exact same number that was used
+      # when that release was originally built, regardless of how much main has moved
+      # on since.
       - name: Determine release tag and version code
         run: |
           if [ "${{ github.ref_type }}" = "tag" ]; then
             RELEASE_TAG="${{ github.ref_name }}"
           else
-            VERSION_MAJOR=$(grep "VERSION_MAJOR" version.properties | cut -d'=' -f2)
-            VERSION_MINOR=$(grep "VERSION_MINOR" version.properties | cut -d'=' -f2)
-            VERSION_PATCH=$(grep "VERSION_PATCH" version.properties | cut -d'=' -f2)
-            RELEASE_TAG="v${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}"
+            RELEASE_TAG=$(git describe --tags --match "v[0-9]*.[0-9]*.[0-9]*" --abbrev=0)
           fi
-          VERSION_CODE=$(grep "VERSION_NUMBER" version.properties | cut -d'=' -f2)
+          VERSION_CODE=$(git rev-list --count "$RELEASE_TAG")
 
           echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
           echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"

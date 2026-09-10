@@ -51,10 +51,10 @@ both admin-only settings:
 
 ### `android-release-play-store.yml` (reusable)
 
-Builds a signed release App Bundle + APK, creates a draft GitHub release, uploads
-the AAB to Play Store Internal Testing, uploads the release APK to Firebase App
-Distribution, and bumps the version on `develop` after a confirmed successful Play
-Store upload. Call it on push to `main`:
+Builds a signed release App Bundle + APK, uploads the AAB to Play Store Internal
+Testing, uploads the release APK to Firebase App Distribution, and - only once that
+upload is confirmed successful - creates the git tag + draft GitHub release that
+records the shipped version. Call it on push to `main`:
 
 ```yaml
 name: Release to Play Store (Internal Testing)
@@ -87,6 +87,28 @@ Required secrets on the calling repo: `ANDROID_KEYSTORE_BASE64`,
 omit the `with:` line entirely if you don't have one, rather than passing an empty
 string.
 
+**Versioning is git-native, not file-based.** The calling app's `app/build.gradle.kts`
+must derive `versionCode`/`versionName` from git (see AgeCalculator's for the
+pattern: `git rev-list --count HEAD` for versionCode, `git describe --tags` for
+versionName, both overridable via `-PreleaseVersionCode`/`-PreleaseVersionName` -
+this workflow passes those explicitly for the actual release build). There's no
+`version.properties` to keep in sync across branches:
+
+- **The next version** comes from the latest reachable `vX.Y.Z` tag plus the release
+  PR's declared bump type - see `## Version Bump` in `AgeCalculator`'s
+  `.github/PULL_REQUEST_TEMPLATE/release.md` (`major`/`minor`/`patch`, default
+  `patch`), extracted the same way `## Release Notes` is. With no tag yet at all,
+  the first release is always `v1.0.0`.
+- **versionCode** is the calling repo's total commit count (`git rev-list --count`) -
+  deterministic from any commit, so `promote-to-production` can reproduce the exact
+  same number later purely from a tag, without needing to persist it anywhere.
+- **The tag itself is only created after a confirmed successful Play Store upload** -
+  a failed release leaves no trace (no orphaned tag or draft release) to clean up;
+  the next attempt just recomputes the same next version fresh.
+
+Requires `fetch-depth: 0` on checkout (already set in this workflow) - a shallow
+checkout can't see the tags or full commit history this depends on.
+
 ### `android-promote-production.yml` (reusable)
 
 Manually promotes the build already sitting on Play Store's Internal Testing track
@@ -94,6 +116,12 @@ straight to Production - no rebuild, no re-upload, just a track move via the Pla
 Developer API. Deliberately `workflow_dispatch`-only in every caller: a production
 rollout is irreversible-ish and user-facing, so it should always need an explicit
 human trigger, never an automatic one.
+
+Resolves the release tag to promote from `github.ref_name` when run from an explicit
+tag ref (via the "Use workflow from" picker), or from the latest reachable `vX.Y.Z`
+tag when run from `main` directly - then recomputes that tag's versionCode via
+`git rev-list --count <tag>`, reproducing exactly what was used when that release was
+built. Also needs `fetch-depth: 0` (already set) for the same reason as above.
 
 ```yaml
 name: Promote Internal Testing to Production
