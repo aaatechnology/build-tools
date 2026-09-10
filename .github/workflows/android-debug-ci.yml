@@ -56,8 +56,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          # On pull_request, check out the real PR head commit - not the default
+          # ephemeral merge-preview commit (PR head merged with the base branch's
+          # current state at the moment the workflow ran, an actual commit but a
+          # throwaway one, never part of permanent history). Without this, versionName
+          # (git describe, computed from whatever's actually checked out) reflects that
+          # synthetic commit while the "Commit:" field elsewhere in this workflow shows
+          # the real head SHA - two different hashes in the same PR comment.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.ref }}
           # Full history so "git log" below can see real commits, not just the
-          # synthetic PR merge commit that a shallow (depth-1) checkout leaves behind.
+          # single commit a shallow (depth-1) checkout leaves behind.
           fetch-depth: 0
 
       - name: Set Up JDK
