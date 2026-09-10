@@ -30,7 +30,7 @@ on:
     secrets:
       firebase_app_id:
         required: true
-      firebase_credential_file_content:
+      credential_file_content:
         required: true
 
 jobs:
@@ -161,7 +161,7 @@ jobs:
         uses: wzieba/Firebase-Distribution-Github-Action@v1
         with:
           appId: ${{ secrets.firebase_app_id }}
-          serviceCredentialsFileContent: ${{ secrets.firebase_credential_file_content }}
+          serviceCredentialsFileContent: ${{ secrets.credential_file_content }}
           groups: ${{ inputs.firebase_testers_group }}
           file: ${{ env.APK_FILE }}
           releaseNotes: |

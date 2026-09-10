@@ -35,9 +35,11 @@ jobs:
 ```
 
 `secrets: inherit` passes the calling repo's `FIREBASE_APP_ID` and
-`CREDENTIAL_FILE_CONTENT` secrets through automatically (the reusable workflow reads
-them as `firebase_app_id` / `firebase_credential_file_content` - see its
-`on.workflow_call.secrets` block). See the file itself for all available inputs.
+`CREDENTIAL_FILE_CONTENT` secrets through automatically - `secrets: inherit` matches
+by name (case-insensitively), so the calling repo's secrets must be named exactly
+`FIREBASE_APP_ID` and `CREDENTIAL_FILE_CONTENT` (see the reusable workflow's
+`on.workflow_call.secrets` block: `firebase_app_id` / `credential_file_content`).
+See the file itself for all available inputs.
 
 ### `artifact-housekeeping.yml`
 
