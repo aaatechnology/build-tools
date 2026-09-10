@@ -1,0 +1,97 @@
+# Reusable promotion workflow shared across aaatechnology Android app repos:
+# manually promotes the build already sitting on Google Play's Internal Testing
+# track straight to Production - no rebuild, no re-upload, just a track move via
+# the Play Developer API (through fastlane's `upload_to_play_store` action). See
+# this repo's README for the calling pattern.
+
+name: Android Promote to Production (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      package_name:
+        description: 'Android application ID on Play Store (e.g. com.arun.agecalculator)'
+        required: true
+        type: string
+      rollout_percentage:
+        description: 'Percent of users to roll out to (1-100). Less than 100 starts a staged rollout.'
+        required: true
+        type: string
+    secrets:
+      play_service_account_json:
+        required: true
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Determine release tag and version code
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            RELEASE_TAG="${{ github.ref_name }}"
+          else
+            VERSION_MAJOR=$(grep "VERSION_MAJOR" version.properties | cut -d'=' -f2)
+            VERSION_MINOR=$(grep "VERSION_MINOR" version.properties | cut -d'=' -f2)
+            VERSION_PATCH=$(grep "VERSION_PATCH" version.properties | cut -d'=' -f2)
+            RELEASE_TAG="v${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}"
+          fi
+          VERSION_CODE=$(grep "VERSION_NUMBER" version.properties | cut -d'=' -f2)
+
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Install fastlane
+        run: gem install fastlane -N
+
+      - name: Write Play service account key
+        env:
+          PLAY_JSON: ${{ secrets.play_service_account_json }}
+        run: printf '%s' "$PLAY_JSON" > play-service-account.json
+
+      # rollout=100 must use status "completed" - the Play API rejects userFraction=1.0
+      # under "inProgress". Anything less starts a real staged rollout.
+      - name: Promote Internal Testing build to Production
+        env:
+          ROLLOUT_PCT: ${{ inputs.rollout_percentage }}
+        run: |
+          if [ "$ROLLOUT_PCT" -ge 100 ]; then
+            STATUS=completed
+            ROLLOUT_ARGS=()
+          else
+            STATUS=inProgress
+            FRACTION=$(awk "BEGIN { printf \"%.2f\", $ROLLOUT_PCT / 100 }")
+            ROLLOUT_ARGS=(rollout:"$FRACTION")
+          fi
+
+          fastlane run upload_to_play_store \
+            package_name:${{ inputs.package_name }} \
+            json_key:play-service-account.json \
+            track:internal \
+            track_promote_to:production \
+            track_promote_release_status:"$STATUS" \
+            version_code:"$VERSION_CODE" \
+            skip_upload_aab:true \
+            skip_upload_apk:true \
+            skip_upload_metadata:true \
+            skip_upload_images:true \
+            skip_upload_screenshots:true \
+            "${ROLLOUT_ARGS[@]}"
+
+      - name: Remove Play service account key
+        if: always()
+        run: rm -f play-service-account.json
+
+      - name: Publish matching GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" --draft=false

@@ -1,0 +1,285 @@
+# Reusable release workflow shared across aaatechnology Android app repos: builds a
+# signed release App Bundle + APK, creates a draft GitHub release, uploads the AAB to
+# Play Store Internal Testing, uploads the release APK to Firebase App Distribution,
+# and bumps the version on develop after a confirmed successful Play Store upload.
+# See this repo's README for the calling pattern.
+
+name: Android Release to Play Store (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      app_display_name:
+        description: 'Display name used in Firebase release notes (e.g. "Age Calculator")'
+        required: true
+        type: string
+      package_name:
+        description: 'Android application ID to upload to Play Store (e.g. com.arun.agecalculator)'
+        required: true
+        type: string
+      firebase_testers_group:
+        description: 'Firebase App Distribution tester group to distribute release builds to'
+        required: false
+        type: string
+        default: 'android-testers'
+      play_internal_testing_link:
+        description: 'Link to the Play Store Internal Testing opt-in page, posted in the PR comment on success'
+        required: false
+        type: string
+        default: ''
+      java_version:
+        description: 'JDK version to build with'
+        required: false
+        type: string
+        default: '17'
+    secrets:
+      android_keystore_base64:
+        required: true
+      android_keystore_password:
+        required: true
+      android_key_alias:
+        required: true
+      android_key_password:
+        required: true
+      play_service_account_json:
+        required: true
+      firebase_app_id:
+        required: true
+      credential_file_content:
+        required: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set Up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: ${{ inputs.java_version }}
+          cache: 'gradle'
+
+      - name: Change wrapper permissions
+        run: chmod +x ./gradlew
+
+      # Reconstructs the ../key/keystore.properties + keystore file that
+      # app/build.gradle.kts's release signingConfig expects, from secrets.
+      - name: Reconstruct release keystore
+        run: |
+          KEY_DIR="$(mkdir -p "${{ github.workspace }}/../key" && cd "${{ github.workspace }}/../key" && pwd)"
+          echo "${{ secrets.android_keystore_base64 }}" | base64 -d > "$KEY_DIR/release.jks"
+          cat > "$KEY_DIR/keystore.properties" <<EOF
+          storeFile=$KEY_DIR/release.jks
+          storePassword=${{ secrets.android_keystore_password }}
+          keyAlias=${{ secrets.android_key_alias }}
+          keyPassword=${{ secrets.android_key_password }}
+          EOF
+
+      - name: Run gradle tests
+        run: ./gradlew testDebugUnitTest
+
+      # Builds both the AAB (for Play Store) and a signed release APK (for Firebase
+      # App Distribution) in one invocation - same signing config, same version stamp.
+      - name: Build release App Bundle and APK
+        run: ./gradlew bundleRelease assembleRelease
+
+      # Looks up the PR associated with this commit (main only ever moves via merged
+      # PRs) and pulls just its "## Release Notes" section - not Summary/Test plan/etc.
+      # Falls back to the commit subject if no PR is found (workflow_dispatch, or a
+      # direct push) or the section was left empty.
+      - name: Extract release notes from the merged PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_JSON=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" --jq '.[0]' 2>/dev/null || echo "")
+          PR_NUMBER=$(echo "$PR_JSON" | jq -r '.number // empty' 2>/dev/null || echo "")
+          PR_BODY=$(echo "$PR_JSON" | jq -r '.body // empty' 2>/dev/null || echo "")
+
+          NOTES=""
+          if [ -n "$PR_BODY" ]; then
+            NOTES=$(printf '%s\n' "$PR_BODY" \
+              | awk '/^## Release Notes/{flag=1; next} /^## /{flag=0} flag' \
+              | sed '/<!--/,/-->/d' \
+              | sed '/./,$!d')
+          fi
+
+          if [ -z "$(echo "$NOTES" | tr -d '[:space:]-')" ]; then
+            NOTES=$(git log -1 --pretty=%s)
+          fi
+
+          echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_ENV
+          echo "RELEASE_NOTES<<EOF" >> $GITHUB_ENV
+          echo "$NOTES" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Determine release tag from version.properties
+        run: |
+          VERSION_MAJOR=$(grep "VERSION_MAJOR" version.properties | cut -d'=' -f2)
+          VERSION_MINOR=$(grep "VERSION_MINOR" version.properties | cut -d'=' -f2)
+          VERSION_PATCH=$(grep "VERSION_PATCH" version.properties | cut -d'=' -f2)
+          VERSION_NUMBER=$(grep "VERSION_NUMBER" version.properties | cut -d'=' -f2)
+          echo "RELEASE_TAG=v${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}" >> $GITHUB_ENV
+          echo "VERSION_CODE=$VERSION_NUMBER" >> $GITHUB_ENV
+          echo "RELEASED_MAJOR=$VERSION_MAJOR" >> $GITHUB_ENV
+          echo "RELEASED_MINOR=$VERSION_MINOR" >> $GITHUB_ENV
+          echo "RELEASED_PATCH=$VERSION_PATCH" >> $GITHUB_ENV
+
+      # Draft, not published - review and publish it yourself once you're happy.
+      # Safe to re-run: skips creation if a release for this tag already exists
+      # (e.g. re-running workflow_dispatch without bumping version.properties).
+      - name: Create draft GitHub release
+        id: gh_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists, skipping creation."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "${{ github.repository }}" \
+              --target "${{ github.sha }}" \
+              --draft \
+              --title "$RELEASE_TAG" \
+              --notes "$RELEASE_NOTES" \
+              app/build/outputs/bundle/release/app-release.aab \
+              app/build/outputs/mapping/release/mapping.txt
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Play Store "what's new" text is capped at 500 characters per locale, and
+      # upload-google-play reads it from a whatsnew-<locale> file in a directory.
+      - name: Write Play Store release notes file
+        run: |
+          mkdir -p whatsnew
+          printf '%s' "$RELEASE_NOTES" | head -c 500 > whatsnew/whatsnew-en-US
+
+      - name: Upload to Play Store (Internal Testing)
+        id: play_upload
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.play_service_account_json }}
+          packageName: ${{ inputs.package_name }}
+          releaseFiles: app/build/outputs/bundle/release/app-release.aab
+          mappingFile: app/build/outputs/mapping/release/mapping.txt
+          track: internal
+          status: completed
+          whatsNewDirectory: whatsnew
+
+      # Play Store Internal Testing can take a while to propagate to testers' devices.
+      # Firebase App Distribution installs instantly, so testers can get the real signed
+      # release build (not the debug one) right away, same tester group as debug builds.
+      - name: Get release APK file name
+        run: |
+          APK_FILE=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
+          echo "RELEASE_APK_FILE=$APK_FILE" >> $GITHUB_ENV
+          echo "Found release APK: $APK_FILE"
+
+      - name: Upload release APK to Firebase App Distribution
+        id: firebase_release_distribution
+        uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ secrets.firebase_app_id }}
+          serviceCredentialsFileContent: ${{ secrets.credential_file_content }}
+          groups: ${{ inputs.firebase_testers_group }}
+          file: ${{ env.RELEASE_APK_FILE }}
+          releaseNotes: |
+            🚀 ${{ inputs.app_display_name }} ${{ env.RELEASE_TAG }} (Release)
+
+            This is the real signed release build - same code going to Play Store
+            Internal Testing, available here immediately instead of waiting on Play
+            Store propagation.
+
+            📋 **Build Details:**
+            - Version: ${{ env.RELEASE_TAG }}, Version Code: ${{ env.VERSION_CODE }}
+
+            📝 **Release Notes:**
+            ${{ env.RELEASE_NOTES }}
+
+      # Reports back on the PR that triggered this release, if one was found.
+      - name: Comment release summary on PR
+        if: always() && env.PR_NUMBER != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ steps.play_upload.outcome }}" = "success" ]; then
+            PLAY_STATUS="✅ Uploaded to Play Store Internal Testing"
+            TESTING_LINK="${{ inputs.play_internal_testing_link != '' && format('🔗 **Test it:** {0}', inputs.play_internal_testing_link) || '' }}"
+          else
+            PLAY_STATUS="❌ Play Store upload failed - check the workflow run"
+            TESTING_LINK=""
+          fi
+          if [ "${{ steps.firebase_release_distribution.outcome }}" = "success" ]; then
+            FIREBASE_STATUS="✅ Release build (signed APK) uploaded to Firebase App Distribution - installs instantly, no need to wait on Play Store propagation"
+          else
+            FIREBASE_STATUS="❌ Firebase App Distribution upload failed - check the workflow run"
+          fi
+          gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body "$(cat <<COMMENT
+          ## 🚀 Release $RELEASE_TAG
+
+          **Version:** $RELEASE_TAG, Version Code: $VERSION_CODE
+          📦 **GitHub release (draft):** ${{ github.server_url }}/${{ github.repository }}/releases/tag/$RELEASE_TAG
+          $PLAY_STATUS
+          $TESTING_LINK
+          🔥 **Firebase:** $FIREBASE_STATUS
+
+          **Release notes used:**
+          $RELEASE_NOTES
+
+          ---
+          *Generated by the Release to Play Store workflow.*
+          COMMENT
+          )"
+
+      # Only runs once the upload is confirmed successful - a failed upload leaves
+      # this version unused, so it should be retried as-is next time, not burned here.
+      # VERSION_PATCH and VERSION_NUMBER are gated independently, each against its own
+      # just-released value - if develop has already moved on for either one (e.g. other
+      # feature work landed its own version.properties change while this release was
+      # still building/uploading), that field is left untouched rather than clobbered,
+      # even if the other field is still safe to bump.
+      - name: Bump version on develop
+        if: steps.play_upload.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch origin develop
+          git checkout -B develop origin/develop
+
+          CURRENT_DEVELOP_MAJOR=$(grep "VERSION_MAJOR" version.properties | cut -d'=' -f2)
+          CURRENT_DEVELOP_MINOR=$(grep "VERSION_MINOR" version.properties | cut -d'=' -f2)
+          CURRENT_DEVELOP_PATCH=$(grep "VERSION_PATCH" version.properties | cut -d'=' -f2)
+          CURRENT_DEVELOP_NUMBER=$(grep "VERSION_NUMBER" version.properties | cut -d'=' -f2)
+          CHANGED=false
+
+          if [ "$CURRENT_DEVELOP_MAJOR" = "$RELEASED_MAJOR" ] && [ "$CURRENT_DEVELOP_MINOR" = "$RELEASED_MINOR" ] && [ "$CURRENT_DEVELOP_PATCH" = "$RELEASED_PATCH" ]; then
+            NEXT_VERSION_PATCH=$((CURRENT_DEVELOP_PATCH + 1))
+            sed -i "s/^VERSION_PATCH=.*/VERSION_PATCH=${NEXT_VERSION_PATCH}/" version.properties
+            CHANGED=true
+          else
+            echo "develop's version (${CURRENT_DEVELOP_MAJOR}.${CURRENT_DEVELOP_MINOR}.${CURRENT_DEVELOP_PATCH}) already differs from the just-released ${RELEASED_MAJOR}.${RELEASED_MINOR}.${RELEASED_PATCH} - leaving VERSION_PATCH as-is."
+          fi
+
+          if [ "$CURRENT_DEVELOP_NUMBER" = "$VERSION_CODE" ]; then
+            NEXT_VERSION_NUMBER=$((CURRENT_DEVELOP_NUMBER + 1))
+            sed -i "s/^VERSION_NUMBER=.*/VERSION_NUMBER=${NEXT_VERSION_NUMBER}/" version.properties
+            CHANGED=true
+          else
+            echo "develop's versionCode (${CURRENT_DEVELOP_NUMBER}) already differs from the just-released ${VERSION_CODE} - leaving VERSION_NUMBER as-is."
+          fi
+
+          if [ "$CHANGED" = "true" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add version.properties
+            git commit -m "Bump version on develop after releasing ${RELEASE_TAG}"
+            git push origin HEAD:develop
+          else
+            echo "Neither field was safe to bump - nothing to commit."
+          fi
