@@ -31,10 +31,23 @@ jobs:
     uses: aaatechnology/build-tools/.github/workflows/android-debug-ci.yml@main
     with:
       app_display_name: Age Calculator
+      auto_merge_to_develop: true
     secrets: inherit
 ```
 
 Required secrets on the calling repo: `FIREBASE_APP_ID`, `CREDENTIAL_FILE_CONTENT`.
+
+`auto_merge_to_develop` (optional, default `false`) queues GitHub's native auto-merge
+on any PR targeting `develop` once this job succeeds. It does **not** bypass review -
+auto-merge only actually merges once every branch-protection requirement on `develop`
+is also satisfied (e.g. an approving review). Two prerequisites on the calling repo,
+both admin-only settings:
+
+- Settings → General → Pull Requests → **Allow auto-merge** must be checked, or
+  `gh pr merge --auto` fails outright.
+- `develop` needs a branch protection rule requiring at least one approving review
+  and this workflow's status check (`build / build`), or auto-merge has nothing to
+  wait for and merges as soon as the build passes with no review at all.
 
 ### `android-release-play-store.yml` (reusable)
 

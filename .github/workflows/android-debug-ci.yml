@@ -27,6 +27,16 @@ on:
         required: false
         type: string
         default: '17'
+      auto_merge_to_develop:
+        description: >-
+          If true, enable GitHub auto-merge on PRs targeting develop once this job
+          succeeds. Auto-merge still waits for branch protection requirements (e.g.
+          an approving review) on develop before actually merging - this only queues
+          it, it does not bypass review. Has no effect on PRs targeting any other
+          branch, or on non-pull_request triggers.
+        required: false
+        type: boolean
+        default: false
     secrets:
       firebase_app_id:
         required: true
@@ -37,7 +47,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # write, not read: enabling auto-merge below performs a merge against the
+      # base branch, which needs write access to contents (in addition to the
+      # pull-requests write already needed for the PR comment step).
+      contents: write
       pull-requests: write
 
     steps:
@@ -222,3 +235,20 @@ jobs:
               repo: context.repo.repo,
               body: comment
             });
+
+      # Queues the merge - it does not bypass develop's branch protection. GitHub
+      # only actually merges once every required check has passed AND every
+      # required review/approval is satisfied, so this is safe to enable even
+      # though it runs as soon as THIS job succeeds, before a human necessarily
+      # has reviewed the PR yet.
+      - name: Enable auto-merge for develop PRs
+        if: >
+          inputs.auto_merge_to_develop &&
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.base.ref == 'develop'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr merge ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --auto --squash --delete-branch
