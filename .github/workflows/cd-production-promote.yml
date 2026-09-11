@@ -22,7 +22,41 @@ on:
         required: true
 
 jobs:
+  # Only runs for a "promote-production" comment on a PR - confirms it's an already-
+  # merged develop -> main PR before letting the promote job below fire, and tells
+  # the commenter why otherwise (wrong branch, not merged yet, or a plain issue).
+  # github.event/github.event_name here reflect the ORIGINAL event that triggered the
+  # calling workflow (issue_comment or workflow_dispatch) - a called reusable workflow
+  # shares the caller's event context, it's not build-tools-specific.
+  check_command:
+    if: github.event_name == 'issue_comment' && github.event.issue.pull_request != null && github.event.comment.body == 'promote-production'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    outputs:
+      should_promote: ${{ steps.check.outputs.should_promote }}
+    steps:
+      - name: Validate this is a merged develop -> main PR
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_JSON=$(gh pr view "${{ github.event.issue.number }}" --repo "${{ github.repository }}" --json merged,baseRefName,headRefName)
+          MERGED=$(echo "$PR_JSON" | jq -r .merged)
+          BASE=$(echo "$PR_JSON" | jq -r .baseRefName)
+          HEAD=$(echo "$PR_JSON" | jq -r .headRefName)
+
+          if [ "$MERGED" = "true" ] && [ "$BASE" = "main" ] && [ "$HEAD" = "develop" ]; then
+            echo "should_promote=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_promote=false" >> "$GITHUB_OUTPUT"
+            gh pr comment "${{ github.event.issue.number }}" --repo "${{ github.repository }}" --body \
+              "⚠️ \`promote-production\` only works on a **merged develop → main** PR. This PR: merged=$MERGED, base=$BASE, head=$HEAD."
+          fi
+
   promote:
+    needs: check_command
+    if: always() && (github.event_name == 'workflow_dispatch' || needs.check_command.outputs.should_promote == 'true')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -100,3 +134,25 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" --draft=false
+
+  # Only for the comment-triggered path - a workflow_dispatch run already shows its
+  # result directly in the Actions UI, but a "promote-production" PR comment has no
+  # other feedback channel back to whoever typed it. always() so this still posts on
+  # a failed promotion, not just a successful one.
+  notify_result:
+    needs: [ check_command, promote ]
+    if: always() && github.event_name == 'issue_comment' && needs.check_command.outputs.should_promote == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment promotion result on the PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ needs.promote.result }}" = "success" ]; then
+            BODY="✅ Promoted to Production successfully (100% rollout)."
+          else
+            BODY="❌ Promotion to Production failed - check the workflow run."
+          fi
+          gh pr comment "${{ github.event.issue.number }}" --repo "${{ github.repository }}" --body "$BODY"
