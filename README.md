@@ -7,13 +7,13 @@ can't silently drift out of sync per-repo again.
 
 ## Workflows
 
-### `android-debug-ci.yml` (reusable)
+### `ci-build-test.yml` (reusable)
 
 Builds the debug APK, runs unit tests + Jacoco coverage, and distributes the APK via
 Firebase App Distribution. Call it from an app repo's own workflow like:
 
 ```yaml
-name: CI-Android APK
+name: CI - Build, Test & Debug APK
 
 on:
   pull_request:
@@ -28,7 +28,7 @@ concurrency:
 
 jobs:
   build:
-    uses: aaatechnology/build-tools/.github/workflows/android-debug-ci.yml@main
+    uses: aaatechnology/build-tools/.github/workflows/ci-build-test.yml@main
     with:
       app_display_name: Age Calculator
       auto_merge_to_develop: true
@@ -49,7 +49,7 @@ both admin-only settings:
   and this workflow's status check (`build / build`), or auto-merge has nothing to
   wait for and merges as soon as the build passes with no review at all.
 
-### `android-release-play-store.yml` (reusable)
+### `cd-internal-testing.yml` (reusable)
 
 Builds a signed release App Bundle + APK, uploads the AAB to Play Store Internal
 Testing, uploads the release APK to Firebase App Distribution, and - only once that
@@ -57,7 +57,7 @@ upload is confirmed successful - creates the git tag + draft GitHub release that
 records the shipped version. Call it on push to `main`:
 
 ```yaml
-name: Release to Play Store (Internal Testing)
+name: CD - Deploy to Internal Testing
 
 on:
   push:
@@ -72,7 +72,7 @@ concurrency:
 
 jobs:
   release:
-    uses: aaatechnology/build-tools/.github/workflows/android-release-play-store.yml@main
+    uses: aaatechnology/build-tools/.github/workflows/cd-internal-testing.yml@main
     with:
       app_display_name: Age Calculator
       package_name: com.arun.agecalculator
@@ -109,7 +109,7 @@ this workflow passes those explicitly for the actual release build). There's no
 Requires `fetch-depth: 0` on checkout (already set in this workflow) - a shallow
 checkout can't see the tags or full commit history this depends on.
 
-### `android-promote-production.yml` (reusable)
+### `cd-production-promote.yml` (reusable)
 
 Manually promotes the build already sitting on Play Store's Internal Testing track
 straight to Production - no rebuild, no re-upload, just a track move via the Play
@@ -124,7 +124,7 @@ tag when run from `main` directly - then recomputes that tag's versionCode via
 built. Also needs `fetch-depth: 0` (already set) for the same reason as above.
 
 ```yaml
-name: Promote Internal Testing to Production
+name: CD - Promote to Production
 
 on:
   workflow_dispatch:
@@ -142,7 +142,7 @@ concurrency:
 
 jobs:
   promote:
-    uses: aaatechnology/build-tools/.github/workflows/android-promote-production.yml@main
+    uses: aaatechnology/build-tools/.github/workflows/cd-production-promote.yml@main
     with:
       package_name: com.arun.agecalculator
       rollout_percentage: ${{ inputs.rollout_percentage }}
