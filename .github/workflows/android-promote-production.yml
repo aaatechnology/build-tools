@@ -34,22 +34,18 @@ jobs:
           # explicit tag ref) and computing its versionCode both need full depth.
           fetch-depth: 0
 
-      # versionCode is recomputed here, not read from anywhere: it's a deterministic
-      # function of a commit (total commit count reachable from it), so computing it
-      # against RELEASE_TAG's commit reproduces the exact same number that was used
-      # when that release was originally built, regardless of how much main has moved
-      # on since.
-      - name: Determine release tag and version code
+      # Only used afterward to un-draft the matching GitHub release - the actual Play
+      # Store promotion below never needs this, it promotes whatever's live on the
+      # source track directly.
+      - name: Determine release tag
         run: |
           if [ "${{ github.ref_type }}" = "tag" ]; then
             RELEASE_TAG="${{ github.ref_name }}"
           else
             RELEASE_TAG=$(git describe --tags --match "[0-9]*.[0-9]*.[0-9]*" --abbrev=0)
           fi
-          VERSION_CODE=$(git rev-list --count "$RELEASE_TAG")
 
           echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
-          echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
 
       - name: Set up Ruby
         uses: ruby/setup-ruby@v1
@@ -66,6 +62,10 @@ jobs:
 
       # rollout=100 must use status "completed" - the Play API rejects userFraction=1.0
       # under "inProgress". Anything less starts a real staged rollout.
+      #
+      # No version_code passed: fastlane's promote_track defaults to whatever's
+      # currently active on the source track when it's omitted, so this always
+      # promotes the real live internal release regardless of git tag state.
       - name: Promote Internal Testing build to Production
         env:
           ROLLOUT_PCT: ${{ inputs.rollout_percentage }}
@@ -85,7 +85,6 @@ jobs:
             track:internal \
             track_promote_to:production \
             track_promote_release_status:"$STATUS" \
-            version_code:"$VERSION_CODE" \
             skip_upload_aab:true \
             skip_upload_apk:true \
             skip_upload_metadata:true \

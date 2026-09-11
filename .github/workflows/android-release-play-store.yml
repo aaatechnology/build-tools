@@ -220,11 +220,27 @@ jobs:
         if: always()
         run: rm -f play-service-account.json
 
+      # Pushes the real git tag ref immediately - independent of the GitHub Release's
+      # draft/public state below. gh release create --draft does NOT push a real tag
+      # ref until the release is published (which may be long after, or never, if it
+      # stays internal-only) - without this step, a later promote-to-production or
+      # play-store-testing run has no way to see that this commit already shipped, and
+      # falls back to whatever older tag does exist.
+      - name: Push git tag for this release
+        if: steps.play_upload.outcome == 'success'
+        run: |
+          if git rev-parse "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Tag $RELEASE_TAG already exists, skipping."
+          else
+            git tag "$RELEASE_TAG" "${{ github.sha }}"
+            git push origin "$RELEASE_TAG"
+          fi
+
       # Only runs once the upload is confirmed successful - a failed upload leaves no
       # tag and no draft release behind at all, so the next attempt just recomputes
       # this same next version fresh, with nothing to clean up first. Safe to re-run:
       # skips creation if a release for this tag already exists.
-      - name: Create git tag and draft GitHub release
+      - name: Create draft GitHub release
         id: gh_release
         if: steps.play_upload.outcome == 'success'
         env:
