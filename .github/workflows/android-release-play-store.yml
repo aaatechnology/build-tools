@@ -175,24 +175,50 @@ jobs:
       - name: Build release App Bundle and APK
         run: ./gradlew bundleRelease assembleRelease -PreleaseVersionName=$RELEASE_VERSION_NAME -PreleaseVersionCode=$VERSION_CODE
 
-      # Play Store "what's new" text is capped at 500 characters per locale, and
-      # upload-google-play reads it from a whatsnew-<locale> file in a directory.
+      # Uploads via fastlane's upload_to_play_store, not r0adkll/upload-google-play -
+      # that action's upload succeeds but then fails at "Committing the Edit" with a
+      # nonsensical "Target SDK of artifact is too low: <our versionCode>" error (a bug
+      # in how it surfaces the real Play API response), so the edit never actually
+      # commits and nothing reaches the track. fastlane is what promote-to-production.yml
+      # (and IFSC's equivalent workflows) already use successfully for the same API.
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Install fastlane
+        run: gem install fastlane -N
+
+      - name: Write Play service account key
+        env:
+          PLAY_JSON: ${{ secrets.play_service_account_json }}
+        run: printf '%s' "$PLAY_JSON" > play-service-account.json
+
+      # Play Store "what's new" text is capped at 500 characters per locale. fastlane's
+      # supply reads it from metadata/android/<locale>/changelogs/<versionCode>.txt.
       - name: Write Play Store release notes file
         run: |
-          mkdir -p whatsnew
-          printf '%s' "$RELEASE_NOTES" | head -c 500 > whatsnew/whatsnew-en-US
+          mkdir -p "metadata/android/en-US/changelogs"
+          printf '%s' "$RELEASE_NOTES" | head -c 500 > "metadata/android/en-US/changelogs/${VERSION_CODE}.txt"
 
       - name: Upload to Play Store (Internal Testing)
         id: play_upload
-        uses: r0adkll/upload-google-play@v1
-        with:
-          serviceAccountJsonPlainText: ${{ secrets.play_service_account_json }}
-          packageName: ${{ inputs.package_name }}
-          releaseFiles: app/build/outputs/bundle/release/app-release.aab
-          mappingFile: app/build/outputs/mapping/release/mapping.txt
-          track: internal
-          status: completed
-          whatsNewDirectory: whatsnew
+        run: |
+          fastlane run upload_to_play_store \
+            package_name:${{ inputs.package_name }} \
+            json_key:play-service-account.json \
+            track:internal \
+            release_status:completed \
+            aab:app/build/outputs/bundle/release/app-release.aab \
+            mapping:app/build/outputs/mapping/release/mapping.txt \
+            metadata_path:metadata \
+            skip_upload_apk:true \
+            skip_upload_images:true \
+            skip_upload_screenshots:true
+
+      - name: Remove Play service account key
+        if: always()
+        run: rm -f play-service-account.json
 
       # Only runs once the upload is confirmed successful - a failed upload leaves no
       # tag and no draft release behind at all, so the next attempt just recomputes
