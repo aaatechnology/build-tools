@@ -54,6 +54,8 @@ on:
         required: true
       credential_file_content:
         required: true
+      gh_packages_read_token:
+        required: true
 
 jobs:
   release:
@@ -61,6 +63,15 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    # Every ./gradlew invocation below needs this: app/build.gradle.kts applies the
+    # aaatech.app-conventions plugin from aaatechnology/build-tools's GitHub Packages
+    # registry, which requires auth to resolve even though the repo is public.
+    env:
+      # Must match gh_packages_read_token's actual owning account (aaatechnology),
+      # not github.actor (whoever triggered this run) - GitHub Packages validates
+      # the pair together.
+      GITHUB_ACTOR: aaatechnology
+      GH_PACKAGES_READ_TOKEN: ${{ secrets.gh_packages_read_token }}
 
     steps:
       - uses: actions/checkout@v5

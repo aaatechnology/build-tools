@@ -10,6 +10,7 @@
 // targetSdk, per-app resValues, proguard files, viewBinding/compose feature flags) stay in
 // each app's own build.gradle.kts.
 
+import com.aaatech.buildtools.AppConfigExtension
 import com.android.build.api.dsl.ApplicationExtension
 import com.android.build.api.variant.ApplicationAndroidComponentsExtension
 import org.gradle.testing.jacoco.plugins.JacocoPluginExtension
@@ -78,10 +79,44 @@ extensions.configure<ApplicationAndroidComponentsExtension> {
             output.versionName.set(versionName)
         }
     }
+
+    // finalizeDsl runs after the whole project (including a consumer's own
+    // android { appConfig { signingKeyVersion = ... } } block, if it sets one) has
+    // been evaluated - reading appConfig.signingKeyVersion any earlier would only
+    // ever see its default (V2), never a consumer's override.
+    finalizeDsl { extension ->
+        val appConfig = extension.extensions.getByType<AppConfigExtension>()
+
+        // Reconstructs the ../key/<file> + keystore file that CI's "Reconstruct
+        // release keystore" step writes from secrets - identical across every app
+        // repo, so the release signingConfig wiring only needs to exist once.
+        val keystorePropertiesFile =
+            project.rootProject.file("../key/${appConfig.signingKeyVersion.propertiesFileName}")
+        if (keystorePropertiesFile.exists()) {
+            val keystoreProperties = Properties()
+            keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+
+            extension.signingConfigs.create("release") {
+                storeFile = project.file(keystoreProperties["storeFile"].toString())
+                storePassword = keystoreProperties["storePassword"].toString()
+                keyAlias = keystoreProperties["keyAlias"].toString()
+                keyPassword = keystoreProperties["keyPassword"].toString()
+            }
+
+            extension.buildTypes.getByName("release") {
+                signingConfig = extension.signingConfigs.getByName("release")
+            }
+        }
+    }
 }
 
 // ---- Common android{} scaffolding --------------------------------------------
 extensions.configure<ApplicationExtension> {
+    // Lets a consuming app override which key signs release builds, e.g.:
+    //   android { appConfig { signingKeyVersion = SigningKeyVersion.V1 } }
+    // Defaults to V2 (keystore.properties) - most apps never need to set this at all.
+    extensions.create<AppConfigExtension>("appConfig")
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -94,30 +129,6 @@ extensions.configure<ApplicationExtension> {
 
     androidResources {
         localeFilters += "en"
-    }
-
-    // Reconstructs the ../key/keystore.properties + keystore file that CI's
-    // "Reconstruct release keystore" step writes from secrets - identical across
-    // every app repo, so the release signingConfig wiring only needs to exist once.
-    val keystorePropertiesFile = project.rootProject.file("../key/keystore.properties")
-    if (keystorePropertiesFile.exists()) {
-        val keystoreProperties = Properties()
-        keystoreProperties.load(FileInputStream(keystorePropertiesFile))
-
-        signingConfigs {
-            create("release") {
-                storeFile = project.file(keystoreProperties["storeFile"].toString())
-                storePassword = keystoreProperties["storePassword"].toString()
-                keyAlias = keystoreProperties["keyAlias"].toString()
-                keyPassword = keystoreProperties["keyPassword"].toString()
-            }
-        }
-
-        buildTypes {
-            release {
-                signingConfig = signingConfigs.getByName("release")
-            }
-        }
     }
 }
 

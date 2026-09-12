@@ -1,4 +1,4 @@
-// Publishes a precompiled Gradle convention plugin (id "aaatechnology.android-app-convention",
+// Publishes a precompiled Gradle convention plugin (id "aaatech.app-conventions",
 // see src/main/kotlin/) to GitHub Packages, so every aaatechnology Android app repo can apply
 // one plugin instead of duplicating git-based versioning, Jacoco setup, and common android{}
 // scaffolding in each app's own build.gradle.kts.
@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "com.aaatech.buildtools"
-version = "0.1.0"
+version = "0.2.0"
 
 repositories {
     google()
