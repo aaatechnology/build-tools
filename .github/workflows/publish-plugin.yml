@@ -1,0 +1,46 @@
+# Publishes the aaatech.app-conventions Gradle plugin (src/main/kotlin/) to this repo's
+# GitHub Packages Maven registry, so app repos (e.g. AgeCalculator) can resolve it via
+# plugins { id("aaatech.app-conventions") version "..." }. GITHUB_TOKEN already has write
+# access to this repo's own packages - no extra secret needed to publish.
+
+name: Publish App Conventions Plugin
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+      - 'src/**'
+      - 'gradle/**'
+      - '.github/workflows/publish-plugin.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-plugin-${{ github.ref }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: '21'
+          cache: 'gradle'
+
+      - name: Change wrapper permissions
+        run: chmod +x ./gradlew
+
+      - name: Publish to GitHub Packages
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./gradlew publish --stacktrace
