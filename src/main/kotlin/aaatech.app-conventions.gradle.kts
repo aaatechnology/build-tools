@@ -11,6 +11,9 @@
 // each app's own build.gradle.kts.
 
 import com.aaatech.buildtools.AppConfigExtension
+import com.aaatech.buildtools.appName
+import com.aaatech.buildtools.enableLog
+import com.aaatech.buildtools.printLog
 import com.android.build.api.dsl.ApplicationExtension
 import com.android.build.api.variant.ApplicationAndroidComponentsExtension
 import org.gradle.testing.jacoco.plugins.JacocoPluginExtension
@@ -106,6 +109,16 @@ extensions.configure<ApplicationAndroidComponentsExtension> {
             extension.buildTypes.getByName("release") {
                 signingConfig = extension.signingConfigs.getByName("release")
             }
+        }
+
+        // Lets a consuming app write, per build type:
+        //   debug { appName = "..."; enableLog = true; printLog = true }
+        // instead of repeating buildConfigField(...) calls itself - generates the
+        // exact same BuildConfig.APP_NAME/ENABLE_LOG/PRINT_LOG fields.
+        extension.buildTypes.forEach { buildType ->
+            buildType.buildConfigField("String", "APP_NAME", "\"${buildType.appName}\"")
+            buildType.buildConfigField("boolean", "ENABLE_LOG", buildType.enableLog.toString())
+            buildType.buildConfigField("boolean", "PRINT_LOG", buildType.printLog.toString())
         }
     }
 }
