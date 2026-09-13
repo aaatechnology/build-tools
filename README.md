@@ -1,9 +1,11 @@
 # build-tools
 
-Shared CI workflows (and eventually common Gradle build logic) for aaatechnology
-Android app repos. Extracted after the same GitHub Actions storage-quota bug was
-found independently copy-pasted across six app repos - fixing it once here means it
-can't silently drift out of sync per-repo again.
+Shared CI workflows and common Gradle build logic for aaatechnology Android app
+repos. The workflows were extracted after the same GitHub Actions storage-quota bug
+was found independently copy-pasted across six app repos; the Gradle plugin
+followed the same pattern after the same versioning/Jacoco/signing boilerplate
+turned up duplicated in every app's own `build.gradle.kts` - fixing each once here
+means neither can silently drift out of sync per-repo again.
 
 ## Workflows
 
@@ -164,6 +166,70 @@ already - `firebase_credential_file_content` vs. the real `CREDENTIAL_FILE_CONTE
 secret). When adding a new caller repo, double check its secret names against each
 reusable workflow's `on.workflow_call.secrets` block above before assuming
 `secrets: inherit` will just work.
+
+## Gradle plugin: `aaatech.app-conventions`
+
+A precompiled Gradle convention plugin, published from this repo (root
+`build.gradle.kts`/`settings.gradle.kts`/`src/main/kotlin/`) to this repo's own
+GitHub Packages Maven registry. It replaces the git-versioning, Jacoco, signing,
+and common `android { }` scaffolding that used to be hand-rolled in every app
+repo's own `app/build.gradle.kts` - see AgeCalculator's `app/build.gradle.kts` for
+the reference consumer.
+
+**What it does**, applied after `com.android.application` in an app's `plugins { }`:
+- Git-native `versionCode`/`versionName` (`git rev-list --count HEAD` /
+  `git describe --tags`), overridable for release builds via
+  `-PreleaseVersionCode`/`-PreleaseVersionName` project properties - the same
+  mechanism `cd-internal-testing.yml`/`cd-production-promote.yml` already rely on.
+- Jacoco setup (`jacoco` plugin + `jacocoTestReportUnitOnly` task), reading Kotlin
+  classes from AGP's built-in Kotlin compiler output path.
+- Release signing: `signingConfigs["release"]` reads `../key/keystore.properties`
+  (the default, `SigningKeyVersion.V2`) or `../key/keystore1.properties`
+  (`SigningKeyVersion.V1`) - selected via `appConfig { signingKeyVersion = ... }`
+  inside the consumer's `android { }` block. A no-op if the file is absent (e.g. a
+  fresh checkout with no local signing key).
+- Common `android { }` scaffolding: `compileOptions` (Java 17),
+  `buildFeatures { buildConfig; resValues }`, `androidResources { localeFilters +=
+  "en" }`.
+- `appName`/`enableLog`/`printLog` properties, settable directly inside each
+  `buildTypes { debug { ... } }`/`release { ... }` block, generating the
+  equivalent `BuildConfig.APP_NAME`/`ENABLE_LOG`/`PRINT_LOG` fields instead of
+  manual `buildConfigField(...)` calls.
+
+**Consuming it in an app repo:**
+1. Add the GitHub Packages repository to `settings.gradle.kts`'s
+   `pluginManagement.repositories`:
+   ```kotlin
+   maven {
+       name = "aaatechBuildTools"
+       url = uri("https://maven.pkg.github.com/aaatechnology/build-tools")
+       credentials {
+           username = System.getenv("GITHUB_ACTOR")
+           password = System.getenv("GH_PACKAGES_READ_TOKEN")
+       }
+   }
+   ```
+2. Apply it: `id("aaatech.app-conventions") version "<see build.gradle.kts's
+   `version` in this repo for the current published version>"`.
+3. A `GH_PACKAGES_READ_TOKEN` repo secret (classic PAT, `read:packages` scope,
+   created while logged in as the `aaatechnology` account - not a personal
+   account, since the credential should be owned by the same account that owns
+   this repo). GitHub Packages requires auth to resolve even though this repo is
+   public - there's no anonymous pull like Docker Hub/npm. Publishing itself needs
+   no extra secret - `GITHUB_TOKEN` already has write access to this repo's own
+   packages.
+4. Pass `gh_packages_read_token: ${{ secrets.gh_packages_read_token }}`-shaped
+   access through to CI: `ci-build-test.yml` and `cd-internal-testing.yml` both
+   declare this as a required secret already and set `GITHUB_ACTOR: aaatechnology`
+   (hardcoded, not `github.actor` - it must match the token's actual owning
+   account) as a job-level `env:` - `secrets: inherit` on the caller side is
+   enough as long as the caller repo's secret is named `GH_PACKAGES_READ_TOKEN`.
+
+**Publishing a new version:** bump `version` in this repo's root `build.gradle.kts`
+and push to `main` - `.github/workflows/publish-plugin.yml` publishes automatically
+on any push touching `build.gradle.kts`, `settings.gradle.kts`, `src/**`, or
+`gradle/**` (or trigger it manually via `workflow_dispatch`). Versioning is manual,
+not git-tag-driven like the app repos.
 
 ### `artifact-housekeeping.yml`
 
