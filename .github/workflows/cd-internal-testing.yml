@@ -222,7 +222,7 @@ jobs:
             release_status:completed \
             aab:app/build/outputs/bundle/release/app-release.aab \
             mapping:app/build/outputs/mapping/release/mapping.txt \
-            metadata_path:metadata \
+            metadata_path:metadata/android \
             skip_upload_apk:true \
             skip_upload_images:true \
             skip_upload_screenshots:true
