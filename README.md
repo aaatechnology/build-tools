@@ -22,14 +22,28 @@ on:
     branches: [ develop, main ]
     paths-ignore:
       - '**.md'
+  # Optional: lets anyone retrigger this build by commenting "build-it" on a PR.
+  # The job-level `if:` below is what actually filters this down to that keyword -
+  # every other issue_comment event falls through without invoking the reusable
+  # workflow at all. Omit this whole block if you don't want comment-triggered
+  # rebuilds for a given app repo.
+  issue_comment:
+    types: [ created ]
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Keyed on the PR/issue number for issue_comment events (github.ref is just the
+  # default branch there, which would otherwise put every PR's "build-it" comment
+  # into the same concurrency group and cancel each other out).
+  group: ci-${{ github.workflow }}-${{ github.event.issue.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
+    if: >
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request != null &&
+       contains(github.event.comment.body, 'build-it'))
     uses: aaatechnology/build-tools/.github/workflows/ci-build-test.yml@main
     with:
       app_display_name: Age Calculator
@@ -50,6 +64,15 @@ both admin-only settings:
 - `develop` needs a branch protection rule requiring at least one approving review
   and this workflow's status check (`build / build`), or auto-merge has nothing to
   wait for and merges as soon as the build passes with no review at all.
+
+**Comment-triggered rebuilds:** the `issue_comment`/`if:` block above is entirely the
+calling repo's responsibility - this reusable workflow itself doesn't declare or filter
+on any trigger (it's `workflow_call`-only), it just needs to resolve the same PR head/
+base SHAs a `pull_request` event gets for free, since `issue_comment` only carries the
+issue/PR number. See the "Resolve PR context" step in `ci-build-test.yml` for how that
+works. A calling repo that omits the `issue_comment` trigger simply never exercises
+this path - no changes needed there to stay on the old pull_request/workflow_dispatch-
+only behavior.
 
 ### `cd-internal-testing.yml` (reusable)
 

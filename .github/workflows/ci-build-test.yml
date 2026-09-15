@@ -7,6 +7,14 @@
 # Extracted after the same storage-quota bug (a GitHub Actions artifact upload with no
 # consumer, blocking every PR check) was found independently copy-pasted across six
 # app repos - fixing it once here means it can't drift out of sync per-repo again.
+#
+# Supports being invoked from an issue_comment event (a "build-it" comment on a PR),
+# not just pull_request/workflow_dispatch - see the "Resolve PR context" step below.
+# The calling repo's own workflow is what actually declares the issue_comment trigger
+# and checks the comment body for the keyword before invoking this job at all; by the
+# time this reusable workflow runs, it just needs to resolve the same PR head/base SHAs
+# a pull_request event gets for free, since issue_comment only carries the issue/PR
+# number, not its head/base refs directly.
 
 name: Android Debug CI (reusable)
 
@@ -65,16 +73,43 @@ jobs:
       GH_PACKAGES_READ_TOKEN: ${{ secrets.gh_packages_read_token }}
 
     steps:
+      # Unifies pull_request and issue_comment ("build-it" PR-comment retrigger)
+      # events behind one set of outputs, so every step below branches on
+      # steps.pr_context.outputs.is_pr instead of re-deriving PR context per event
+      # type. issue_comment doesn't carry pull_request.head/base directly - it only
+      # has the issue/PR number - so it needs one API call to resolve the same
+      # head/base SHAs a pull_request event gets for free.
+      - name: Resolve PR context
+        id: pr_context
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "is_pr=true" >> "$GITHUB_OUTPUT"
+            echo "head_sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+            echo "base_sha=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head_ref=${{ github.event.pull_request.head.ref }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "issue_comment" ]; then
+            PR_JSON=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}")
+            echo "is_pr=true" >> "$GITHUB_OUTPUT"
+            echo "head_sha=$(echo "$PR_JSON" | jq -r '.head.sha')" >> "$GITHUB_OUTPUT"
+            echo "base_sha=$(echo "$PR_JSON" | jq -r '.base.sha')" >> "$GITHUB_OUTPUT"
+            echo "head_ref=$(echo "$PR_JSON" | jq -r '.head.ref')" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_pr=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v5
         with:
-          # On pull_request, check out the real PR head commit - not the default
-          # ephemeral merge-preview commit (PR head merged with the base branch's
-          # current state at the moment the workflow ran, an actual commit but a
-          # throwaway one, never part of permanent history). Without this, versionName
-          # (git describe, computed from whatever's actually checked out) reflects that
-          # synthetic commit while the "Commit:" field elsewhere in this workflow shows
-          # the real head SHA - two different hashes in the same PR comment.
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.ref }}
+          # On pull_request/issue_comment, check out the real PR head commit - not
+          # the default ephemeral merge-preview commit (PR head merged with the base
+          # branch's current state at the moment the workflow ran, an actual commit
+          # but a throwaway one, never part of permanent history). Without this,
+          # versionName (git describe, computed from whatever's actually checked
+          # out) reflects that synthetic commit while the "Commit:" field elsewhere
+          # in this workflow shows the real head SHA - two different hashes in the
+          # same PR comment.
+          ref: ${{ steps.pr_context.outputs.is_pr == 'true' && steps.pr_context.outputs.head_sha || github.ref }}
           # Full history so "git log" below can see real commits, not just the
           # single commit a shallow (depth-1) checkout leaves behind.
           fetch-depth: 0
@@ -124,8 +159,8 @@ jobs:
       # pull_request events, not the real PR head) and its short hash + subject line.
       - name: Get commit message
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            COMMIT_SHA="${{ github.event.pull_request.head.sha }}"
+          if [ "${{ steps.pr_context.outputs.is_pr }}" = "true" ]; then
+            COMMIT_SHA="${{ steps.pr_context.outputs.head_sha }}"
           else
             COMMIT_SHA="${{ github.sha }}"
           fi
@@ -143,8 +178,8 @@ jobs:
       # (e.g. after a merge), fall back to the last 10 non-merge commits from HEAD.
       - name: Generate release notes from commits
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            COMMIT_MESSAGES=$(git log ${{ github.event.pull_request.base.sha }}..${{ env.COMMIT_SHA }} --no-merges --pretty=format:"• %s" 2>/dev/null || echo "")
+          if [ "${{ steps.pr_context.outputs.is_pr }}" = "true" ]; then
+            COMMIT_MESSAGES=$(git log ${{ steps.pr_context.outputs.base_sha }}..${{ env.COMMIT_SHA }} --no-merges --pretty=format:"• %s" 2>/dev/null || echo "")
           else
             COMMIT_MESSAGES=$(git log -10 --no-merges --pretty=format:"• %s" 2>/dev/null || echo "")
           fi
@@ -199,15 +234,17 @@ jobs:
 
             📋 **Build Details:**
             - Version: ${{ env.VERSION_NAME }}, Version Code: ${{ env.VERSION_CODE }}
-            - Branch: ${{ github.head_ref || github.ref_name }}
+            - Branch: ${{ steps.pr_context.outputs.head_ref || github.ref_name }}
             - Commit: ${{ env.COMMIT_SHA_SHORT }} - ${{ env.COMMIT_MESSAGE_SUBJECT }}
             - Workflow run: ${{ github.run_number }}
             - Date: ${{ env.CURRENT_DATE }}
             - Unit test coverage: ${{ env.COVERAGE_SUMMARY }}
 
-      # Post APK and Firebase links as PR comment
+      # Post APK and Firebase links as PR comment. context.issue.number resolves
+      # correctly for both pull_request and issue_comment events, so this needs no
+      # special-casing beyond the is_pr gate itself.
       - name: Post links to PR
-        if: github.event_name == 'pull_request'
+        if: steps.pr_context.outputs.is_pr == 'true'
         uses: actions/github-script@v8
         with:
           script: |
@@ -218,7 +255,7 @@ jobs:
             const buildInfo = `
             📋 **Build Information:**
             - **Version:** ${{ env.VERSION_NAME }}, Version Code: ${{ env.VERSION_CODE }}
-            - **Branch:** ${{ github.head_ref || github.ref_name }}
+            - **Branch:** ${{ steps.pr_context.outputs.head_ref || github.ref_name }}
             - **Commit:** \`${{ env.COMMIT_SHA_SHORT }}\` - ${{ env.COMMIT_MESSAGE_SUBJECT }}
             - **Workflow run:** #${{ github.run_number }}
             - **Date:** ${{ env.CURRENT_DATE }}
