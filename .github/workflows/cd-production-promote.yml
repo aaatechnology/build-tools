@@ -41,17 +41,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          PR_JSON=$(gh pr view "${{ github.event.issue.number }}" --repo "${{ github.repository }}" --json merged,baseRefName,headRefName)
-          MERGED=$(echo "$PR_JSON" | jq -r .merged)
+          PR_JSON=$(gh pr view "${{ github.event.issue.number }}" --repo "${{ github.repository }}" --json state,baseRefName,headRefName)
+          STATE=$(echo "$PR_JSON" | jq -r .state)
           BASE=$(echo "$PR_JSON" | jq -r .baseRefName)
           HEAD=$(echo "$PR_JSON" | jq -r .headRefName)
 
-          if [ "$MERGED" = "true" ] && [ "$BASE" = "main" ] && [ "$HEAD" = "develop" ]; then
+          if [ "$STATE" = "MERGED" ] && [ "$BASE" = "main" ] && [ "$HEAD" = "develop" ]; then
             echo "should_promote=true" >> "$GITHUB_OUTPUT"
           else
             echo "should_promote=false" >> "$GITHUB_OUTPUT"
             gh pr comment "${{ github.event.issue.number }}" --repo "${{ github.repository }}" --body \
-              "⚠️ \`promote-production\` only works on a **merged develop → main** PR. This PR: merged=$MERGED, base=$BASE, head=$HEAD."
+              "⚠️ \`promote-production\` only works on a **merged develop → main** PR. This PR: state=$STATE, base=$BASE, head=$HEAD."
           fi
 
   promote:
