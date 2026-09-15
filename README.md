@@ -44,6 +44,16 @@ jobs:
       github.event_name != 'issue_comment' ||
       (github.event.issue.pull_request != null &&
        contains(github.event.comment.body, 'build-it'))
+    # Required on the caller if this repo's default Actions token permissions
+    # (Settings -> Actions -> General -> Workflow permissions) aren't "Read and
+    # write" - without it, the reusable workflow's own contents:write/
+    # pull-requests:write request gets capped down to the repo default and the
+    # call fails at startup with "Invalid workflow file" / "The nested job ...
+    # is requesting ..., but is only allowed ...". Harmless to include even when
+    # the repo default is already permissive enough.
+    permissions:
+      contents: write
+      pull-requests: write
     uses: aaatechnology/build-tools/.github/workflows/ci-build-test.yml@main
     with:
       app_display_name: Age Calculator
@@ -97,6 +107,11 @@ concurrency:
 
 jobs:
   release:
+    # See the note under ci-build-test.yml's example above - required unless this
+    # repo's default Actions token permissions are already "Read and write".
+    permissions:
+      contents: write
+      pull-requests: write
     uses: aaatechnology/build-tools/.github/workflows/cd-internal-testing.yml@main
     with:
       app_display_name: Age Calculator
@@ -167,6 +182,11 @@ concurrency:
 
 jobs:
   promote:
+    # See the note under ci-build-test.yml's example above - required unless this
+    # repo's default Actions token permissions are already "Read and write".
+    permissions:
+      contents: write
+      pull-requests: write
     uses: aaatechnology/build-tools/.github/workflows/cd-production-promote.yml@main
     with:
       package_name: com.arun.agecalculator
