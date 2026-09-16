@@ -232,12 +232,25 @@ the reference consumer.
   inside the consumer's `android { }` block. A no-op if the file is absent (e.g. a
   fresh checkout with no local signing key).
 - Common `android { }` scaffolding: `compileOptions` (Java 17),
-  `buildFeatures { buildConfig; resValues }`, `androidResources { localeFilters +=
-  "en" }`.
+  `buildFeatures { buildConfig; resValues }`.
 - `appName`/`enableLog`/`printLog` properties, settable directly inside each
   `buildTypes { debug { ... } }`/`release { ... }` block, generating the
   equivalent `BuildConfig.APP_NAME`/`ENABLE_LOG`/`PRINT_LOG` fields instead of
   manual `buildConfigField(...)` calls.
+- **Locale filtering is opt-in, not automatic** - `appConfig { supportedLocales =
+  listOf("en", "ta") }` (see below) sets `androidResources.localeFilters` to exactly
+  that list, stripping every other locale's resources (including this app's own
+  translations) during packaging. Leave it unset (the default) to ship every locale
+  as-is, with no filtering at all. **List every locale this app's own resources use**
+  - Astrology shipped with `values-ta/*` silently stripped from the packaged app for
+    a while because an earlier version of this plugin defaulted to `localeFilters +=
+    "en"` unconditionally, and Astrology's `values-ta` strings were never explicitly
+    kept. Confirmed via `aapt2 dump resources`/`dump configurations`: the built APK
+    had only the default (English) value for `birth_details`, no `ta`-qualified one,
+    and no `ta` in the packaged configurations at all - the app couldn't have shown
+    Tamil no matter what the UI code did. Only opt into this if you specifically want
+    the smaller APK from dropping dependency-only locales (AndroidX, Play Services,
+    etc. bundle translations for dozens of languages you likely never asked for).
 
 **Consuming it in an app repo:**
 1. Add the GitHub Packages repository to `settings.gradle.kts`'s
@@ -253,7 +266,15 @@ the reference consumer.
    }
    ```
 2. Apply it: `id("aaatech.app-conventions") version "<see build.gradle.kts's
-   `version` in this repo for the current published version>"`.
+   `version` in this repo for the current published version>"`. If the app supports
+   more than one locale, also set (inside the consumer's own `android { }` block):
+   ```kotlin
+   appConfig {
+       supportedLocales = listOf("en", "ta") // every locale this app's own resources use
+   }
+   ```
+   Leave this unset for a single-locale (English) app - no filtering happens by
+   default.
 3. A `GH_PACKAGES_READ_TOKEN` repo secret (classic PAT, `read:packages` scope,
    created while logged in as the `aaatechnology` account - not a personal
    account, since the credential should be owned by the same account that owns

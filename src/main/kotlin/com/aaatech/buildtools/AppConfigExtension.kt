@@ -10,4 +10,15 @@ enum class SigningKeyVersion(val propertiesFileName: String) {
 
 open class AppConfigExtension {
     var signingKeyVersion: SigningKeyVersion = SigningKeyVersion.V2
+
+    // Locale qualifiers (e.g. "en", "ta") to keep when packaging - every other
+    // locale's resources (this app's own translated strings included) get stripped
+    // during resource linking. Empty (the default) means no filtering at all: every
+    // locale ships, including whatever translations are bundled in dependencies
+    // (AndroidX, Play Services, etc.) - safe by default, since an app that forgets
+    // to list a locale it actually supports would otherwise silently lose it from
+    // the packaged app. Only set this if you specifically want the smaller APK that
+    // comes from dropping dependency-only locales - and list every locale this app's
+    // own resources use, or the same silent-strip bug bites again.
+    var supportedLocales: List<String> = emptyList()
 }

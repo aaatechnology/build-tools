@@ -120,6 +120,14 @@ extensions.configure<ApplicationAndroidComponentsExtension> {
             buildType.buildConfigField("boolean", "ENABLE_LOG", buildType.enableLog.toString())
             buildType.buildConfigField("boolean", "PRINT_LOG", buildType.printLog.toString())
         }
+
+        // Opt-in only - see AppConfigExtension.supportedLocales. Read here (not in
+        // the eager androidResources block below) for the same reason
+        // signingKeyVersion is: a consumer's own
+        // android { appConfig { supportedLocales = ... } } must be evaluated first.
+        if (appConfig.supportedLocales.isNotEmpty()) {
+            extension.androidResources.localeFilters += appConfig.supportedLocales
+        }
     }
 }
 
@@ -138,10 +146,6 @@ extensions.configure<ApplicationExtension> {
     buildFeatures {
         buildConfig = true
         resValues = true
-    }
-
-    androidResources {
-        localeFilters += "en"
     }
 }
 
