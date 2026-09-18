@@ -192,8 +192,17 @@ tasks.register<JacocoReport>("jacocoTestReportUnitOnly") {
 
     sourceDirectories.setFrom(files("${project.projectDir}/src/main/java"))
     classDirectories.setFrom(jacocoClassDirectories())
+    // AGP's own instrumentation (android.buildTypes.debug { enableUnitTestCoverage =
+    // true }, which every consumer of this plugin sets) writes .exec data under
+    // outputs/unit_test_code_coverage/, not the classic Gradle jacoco plugin's
+    // build/jacoco/<taskName>.exec default - that path is never actually produced
+    // once AGP is managing instrumentation, so this task previously always read an
+    // empty/nonexistent file and silently reported "report not found" downstream
+    // (surfaced via ci-build-test.yml's coverage PR comment). Both patterns are kept
+    // so a project not using enableUnitTestCoverage still finds the classic path.
     executionData.setFrom(fileTree(layout.buildDirectory.get()) {
         include("jacoco/testDebugUnitTest.exec")
+        include("outputs/unit_test_code_coverage/debugUnitTest/*.exec")
     })
 }
 
