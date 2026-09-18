@@ -124,29 +124,77 @@ jobs:
       - name: Change wrapper permissions
         run: chmod +x ./gradlew
 
-      # Run Tests Build + unit-test-only Jacoco coverage report (no device needed),
-      # and assemble the debug APK - combined into one invocation to avoid paying
-      # Gradle daemon startup/configuration twice.
+      # Run Tests Build + Jacoco coverage reports (no device needed) - the
+      # combined (all-modules) report, each module's own, and the module-name
+      # list the next step reads - and assemble the debug APK, combined into one
+      # invocation to avoid paying Gradle daemon startup/configuration twice. All
+      # three tasks come from aaatech.app-conventions (>= 0.8.0) and are safe
+      # zero-config no-ops for any module lacking tests or enableUnitTestCoverage.
       - name: Run gradle tests and build debug APK
-        run: ./gradlew jacocoTestReportUnitOnly assembleDebug
+        run: ./gradlew moduleJacocoReport combinedJacocoReport listCoverageModules assembleDebug
 
       - name: Parse unit test coverage
         run: |
-          REPORT="app/build/reports/jacoco/jacocoTestReportUnitOnly/jacocoTestReportUnitOnly.xml"
-          if [ -f "$REPORT" ]; then
-            LINE_COUNTER=$(grep -o '<counter type="LINE"[^/]*/>' "$REPORT" | tail -1)
-            MISSED=$(echo "$LINE_COUNTER" | grep -oE 'missed="[0-9]+"' | grep -oE '[0-9]+')
-            COVERED=$(echo "$LINE_COUNTER" | grep -oE 'covered="[0-9]+"' | grep -oE '[0-9]+')
-            TOTAL=$((MISSED + COVERED))
-            if [ "$TOTAL" -gt 0 ]; then
-              COVERAGE_PCT=$(awk "BEGIN { printf \"%.1f\", ($COVERED / $TOTAL) * 100 }")
-            else
-              COVERAGE_PCT="0.0"
+          # Prints "covered total" (two numbers) from a JaCoCo XML report, or
+          # nothing at all if the report doesn't exist (module had no tests/
+          # coverage data - not an error, see aaatech.app-conventions).
+          parse_counts() {
+            local report="$1"
+            if [ -f "$report" ]; then
+              local line_counter missed covered
+              line_counter=$(grep -o '<counter type="LINE"[^/]*/>' "$report" | tail -1)
+              missed=$(echo "$line_counter" | grep -oE 'missed="[0-9]+"' | grep -oE '[0-9]+')
+              covered=$(echo "$line_counter" | grep -oE 'covered="[0-9]+"' | grep -oE '[0-9]+')
+              echo "$covered $((missed + covered))"
             fi
-            echo "COVERAGE_SUMMARY=${COVERAGE_PCT}% lines covered (${COVERED}/${TOTAL})" >> $GITHUB_ENV
+          }
+
+          format_pct() {
+            local covered="$1" total="$2"
+            if [ "$total" -gt 0 ]; then
+              awk "BEGIN { printf \"%.1f\", ($covered / $total) * 100 }"
+            else
+              echo "0.0"
+            fi
+          }
+
+          # Overall figure: the combined (all-modules) report, always registered
+          # on the app module by aaatech.app-conventions.
+          read -r OVERALL_COVERED OVERALL_TOTAL <<< "$(parse_counts "app/build/reports/jacoco/combinedJacocoReport/combinedJacocoReport.xml")"
+          if [ -z "$OVERALL_TOTAL" ]; then
+            COVERAGE_SUMMARY="unavailable (report not found)"
           else
-            echo "COVERAGE_SUMMARY=unavailable (report not found)" >> $GITHUB_ENV
+            COVERAGE_SUMMARY="$(format_pct "$OVERALL_COVERED" "$OVERALL_TOTAL")% lines covered (${OVERALL_COVERED}/${OVERALL_TOTAL})"
           fi
+
+          # Per-module breakdown: every subproject Gradle itself reports (via
+          # listCoverageModules, the live project model - not a text-parsed
+          # guess at settings.gradle.kts's include(...) syntax, which varies
+          # across repos), skipped entirely when there's only one module
+          # (nothing to break down) - so a single-app-module repo's comment
+          # looks exactly like it did before this feature existed.
+          MODULES=$(cat app/build/coverage-modules.txt 2>/dev/null || true)
+          MODULE_COUNT=$(echo "$MODULES" | grep -c . || true)
+
+          COVERAGE_BREAKDOWN=""
+          if [ "$MODULE_COUNT" -gt 1 ]; then
+            while IFS= read -r module; do
+              [ -z "$module" ] && continue
+              read -r MOD_COVERED MOD_TOTAL <<< "$(parse_counts "$module/build/reports/jacoco/moduleJacocoReport/moduleJacocoReport.xml")"
+              if [ -z "$MOD_TOTAL" ]; then
+                MOD_RESULT="no tests found"
+              else
+                MOD_RESULT="$(format_pct "$MOD_COVERED" "$MOD_TOTAL")% (${MOD_COVERED}/${MOD_TOTAL})"
+              fi
+              COVERAGE_BREAKDOWN="${COVERAGE_BREAKDOWN}  - ${module}: ${MOD_RESULT}
+          "
+            done <<< "$MODULES"
+          fi
+
+          echo "COVERAGE_SUMMARY=${COVERAGE_SUMMARY}" >> $GITHUB_ENV
+          echo "COVERAGE_BREAKDOWN<<COVERAGE_BREAKDOWN_EOF" >> $GITHUB_ENV
+          echo "${COVERAGE_BREAKDOWN}" >> $GITHUB_ENV
+          echo "COVERAGE_BREAKDOWN_EOF" >> $GITHUB_ENV
 
       # Get the APK file name dynamically
       - name: Get APK file name
@@ -239,6 +287,7 @@ jobs:
             - Workflow run: ${{ github.run_number }}
             - Date: ${{ env.CURRENT_DATE }}
             - Unit test coverage: ${{ env.COVERAGE_SUMMARY }}
+            ${{ env.COVERAGE_BREAKDOWN }}
 
       # Post APK and Firebase links as PR comment. context.issue.number resolves
       # correctly for both pull_request and issue_comment events, so this needs no
@@ -260,6 +309,7 @@ jobs:
             - **Workflow run:** #${{ github.run_number }}
             - **Date:** ${{ env.CURRENT_DATE }}
             - **Unit test coverage:** ${{ env.COVERAGE_SUMMARY }}
+            ${{ env.COVERAGE_BREAKDOWN }}
             `;
 
             // Recent changes

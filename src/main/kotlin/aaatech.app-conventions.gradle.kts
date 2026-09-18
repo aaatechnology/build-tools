@@ -206,16 +206,55 @@ tasks.register<JacocoReport>("jacocoTestReportUnitOnly") {
     })
 }
 
-// ---- Combined multi-module coverage (every subproject in the build) ------------
-// Registered unconditionally, works with zero config - harmless either way, since
-// this task only ever runs when explicitly requested. A module that isn't Android/
-// Kotlin, has no tests, or lacks android.buildTypes.debug { enableUnitTestCoverage
-// = true } (the same flag this plugin's own jacocoTestReportUnitOnly relies on)
-// simply contributes nothing: dependsOn on a `tasks.matching {}` empty result and
-// fileTree over a directory that doesn't exist are both already no-ops, not
-// errors - so there's no per-module config to add here, and no per-repo build-tools
-// change needed for a new project shaped like this one (AGP's built-in Kotlin
-// compiler, standard debug/release build types).
+// ---- Multi-module coverage (every subproject in the build) ---------------------
+// Both tasks below are registered unconditionally, work with zero config - harmless
+// either way, since they only ever run when explicitly requested. A module that
+// isn't Android/Kotlin, has no tests, or lacks android.buildTypes.debug {
+// enableUnitTestCoverage = true } (the same flag this plugin's own
+// jacocoTestReportUnitOnly relies on) simply contributes nothing: dependsOn on a
+// `tasks.matching {}` empty result and fileTree over a directory that doesn't
+// exist are both already no-ops, not errors - so there's no per-module config to
+// add here, and no per-repo build-tools change needed for a new project shaped
+// like this one (AGP's built-in Kotlin compiler, standard debug/release build
+// types).
+
+fun moduleSourceDirs(module: Project) =
+    listOf(File(module.projectDir, "src/main/java"), File(module.projectDir, "src/main/kotlin"))
+
+fun moduleClassDirs(module: Project) = fileTree(
+    "${module.layout.buildDirectory.get()}/intermediates/built_in_kotlinc/debug/compileDebugKotlin/classes"
+) {
+    include("**/*.class")
+    exclude(jacocoFileFilter)
+}
+
+fun moduleExecData(module: Project) = fileTree(module.layout.buildDirectory.get()) {
+    include("outputs/unit_test_code_coverage/debugUnitTest/*.exec")
+}
+
+// One report per subproject (registered ON that subproject, not on this app
+// module, so `./gradlew moduleJacocoReport` from the root runs it in every
+// project that has it, each writing to its own build/reports/jacoco/
+// moduleJacocoReport/moduleJacocoReport.xml) - lets CI show a per-module coverage
+// breakdown without hardcoding module names anywhere, alongside the combined
+// (all-modules) figure below.
+project.rootProject.subprojects.forEach { module ->
+    module.tasks.register<JacocoReport>("moduleJacocoReport") {
+        group = "verification"
+        description = "Generates this module's own JaCoCo coverage report."
+        dependsOn(module.tasks.matching { it.name == "testDebugUnitTest" })
+
+        reports {
+            xml.required.set(true)
+            html.required.set(true)
+        }
+
+        sourceDirectories.setFrom(files(moduleSourceDirs(module)))
+        classDirectories.setFrom(files(moduleClassDirs(module)))
+        executionData.setFrom(files(moduleExecData(module)))
+    }
+}
+
 tasks.register<JacocoReport>("combinedJacocoReport") {
     group = "verification"
     description = "Generates one merged JaCoCo coverage report across every subproject."
@@ -233,30 +272,29 @@ tasks.register<JacocoReport>("combinedJacocoReport") {
 
     // Every subproject's own build dir, not just this app module's - unlike
     // jacocoClassDirectories()/sourceDirectories above, which are scoped to project.
-    sourceDirectories.setFrom(
-        files(
-            modules.flatMap { module ->
-                listOf(File(module.projectDir, "src/main/java"), File(module.projectDir, "src/main/kotlin"))
-            }
-        )
-    )
-    classDirectories.setFrom(
-        files(
-            modules.map { module ->
-                fileTree("${module.layout.buildDirectory.get()}/intermediates/built_in_kotlinc/debug/compileDebugKotlin/classes") {
-                    include("**/*.class")
-                    exclude(jacocoFileFilter)
-                }
-            }
-        )
-    )
-    executionData.setFrom(
-        files(
-            modules.map { module ->
-                fileTree(module.layout.buildDirectory.get()) {
-                    include("outputs/unit_test_code_coverage/debugUnitTest/*.exec")
-                }
-            }
-        )
-    )
+    sourceDirectories.setFrom(files(modules.flatMap { moduleSourceDirs(it) }))
+    classDirectories.setFrom(files(modules.map { moduleClassDirs(it) }))
+    executionData.setFrom(files(modules.map { moduleExecData(it) }))
+}
+
+// Writes every subproject's name, one per line, to a file CI can just `cat` -
+// the actual live Gradle project model, not a text-parsed guess at
+// settings.gradle.kts's include(...) syntax (which varies: one include() per
+// module vs one call listing several, Kotlin DSL vs Groovy, dynamic inclusion,
+// etc.). This is what tells CI's coverage step how many modules exist, so it
+// knows whether to print a per-module breakdown at all.
+tasks.register("listCoverageModules") {
+    group = "verification"
+    description = "Writes every subproject name (one per line) for CI's coverage breakdown to read."
+
+    val outputFile = layout.buildDirectory.file("coverage-modules.txt")
+    // Captured at configuration time, not read from `project`/`rootProject`
+    // inside doLast - the latter is unsupported under the configuration cache
+    // (Task.project can't be invoked at execution time).
+    val moduleNames = project.rootProject.subprojects.map { it.name }
+    outputs.file(outputFile)
+
+    doLast {
+        outputFile.get().asFile.writeText(moduleNames.joinToString("\n"))
+    }
 }
