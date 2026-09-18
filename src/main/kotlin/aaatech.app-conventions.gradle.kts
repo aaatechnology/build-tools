@@ -19,6 +19,7 @@ import com.android.build.api.variant.ApplicationAndroidComponentsExtension
 import org.gradle.testing.jacoco.plugins.JacocoPluginExtension
 import org.gradle.testing.jacoco.plugins.JacocoTaskExtension
 import org.gradle.testing.jacoco.tasks.JacocoReport
+import java.io.File
 import java.io.FileInputStream
 import java.util.Properties
 
@@ -194,4 +195,59 @@ tasks.register<JacocoReport>("jacocoTestReportUnitOnly") {
     executionData.setFrom(fileTree(layout.buildDirectory.get()) {
         include("jacoco/testDebugUnitTest.exec")
     })
+}
+
+// ---- Combined multi-module coverage (every subproject in the build) ------------
+// Registered unconditionally, works with zero config - harmless either way, since
+// this task only ever runs when explicitly requested. A module that isn't Android/
+// Kotlin, has no tests, or lacks android.buildTypes.debug { enableUnitTestCoverage
+// = true } (the same flag this plugin's own jacocoTestReportUnitOnly relies on)
+// simply contributes nothing: dependsOn on a `tasks.matching {}` empty result and
+// fileTree over a directory that doesn't exist are both already no-ops, not
+// errors - so there's no per-module config to add here, and no per-repo build-tools
+// change needed for a new project shaped like this one (AGP's built-in Kotlin
+// compiler, standard debug/release build types).
+tasks.register<JacocoReport>("combinedJacocoReport") {
+    group = "verification"
+    description = "Generates one merged JaCoCo coverage report across every subproject."
+
+    val modules = project.rootProject.subprojects
+
+    modules.forEach { module ->
+        dependsOn(module.tasks.matching { it.name == "testDebugUnitTest" })
+    }
+
+    reports {
+        xml.required.set(true)
+        html.required.set(true)
+    }
+
+    // Every subproject's own build dir, not just this app module's - unlike
+    // jacocoClassDirectories()/sourceDirectories above, which are scoped to project.
+    sourceDirectories.setFrom(
+        files(
+            modules.flatMap { module ->
+                listOf(File(module.projectDir, "src/main/java"), File(module.projectDir, "src/main/kotlin"))
+            }
+        )
+    )
+    classDirectories.setFrom(
+        files(
+            modules.map { module ->
+                fileTree("${module.layout.buildDirectory.get()}/intermediates/built_in_kotlinc/debug/compileDebugKotlin/classes") {
+                    include("**/*.class")
+                    exclude(jacocoFileFilter)
+                }
+            }
+        )
+    )
+    executionData.setFrom(
+        files(
+            modules.map { module ->
+                fileTree(module.layout.buildDirectory.get()) {
+                    include("outputs/unit_test_code_coverage/debugUnitTest/*.exec")
+                }
+            }
+        )
+    )
 }
