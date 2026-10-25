@@ -3,7 +3,7 @@
 # plugins { id("aaatech.build-tools") version "..." }. GITHUB_TOKEN already has write
 # access to this repo's own packages - no extra secret needed to publish.
 
-name: Publish App Conventions Plugin
+name: Publish Build Tools Plugin
 
 on:
   push:
