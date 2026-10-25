@@ -1,6 +1,6 @@
-# Publishes the aaatech.build-tools Gradle plugin (src/main/kotlin/) to this repo's
+# Publishes the com.aaatech.build-tools Gradle plugin (src/main/kotlin/) to this repo's
 # GitHub Packages Maven registry, so app repos (e.g. AgeCalculator) can resolve it via
-# plugins { id("aaatech.build-tools") version "..." }. GITHUB_TOKEN already has write
+# plugins { id("com.aaatech.build-tools") version "..." }. GITHUB_TOKEN already has write
 # access to this repo's own packages - no extra secret needed to publish.
 
 name: Publish Build Tools Plugin

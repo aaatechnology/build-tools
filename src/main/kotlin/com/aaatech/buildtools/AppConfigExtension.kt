@@ -1,6 +1,6 @@
 package com.aaatech.buildtools
 
-// Which ../key/*.properties file the aaatech.build-tools plugin's release signing
+// Which ../key/*.properties file the com.aaatech.build-tools plugin's release signing
 // config is loaded from. V2 is the default for every app - only override when an app
 // specifically needs to sign with an older key.
 enum class SigningKeyVersion(val propertiesFileName: String) {

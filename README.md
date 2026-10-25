@@ -210,7 +210,7 @@ secret). When adding a new caller repo, double check its secret names against ea
 reusable workflow's `on.workflow_call.secrets` block above before assuming
 `secrets: inherit` will just work.
 
-## Gradle plugin: `aaatech.build-tools`
+## Gradle plugin: `com.aaatech.build-tools`
 
 A precompiled Gradle convention plugin, published from this repo (root
 `build.gradle.kts`/`settings.gradle.kts`/`src/main/kotlin/`) to this repo's own
@@ -274,7 +274,7 @@ the reference consumer.
        }
    }
    ```
-2. Apply it: `id("aaatech.build-tools") version "<see build.gradle.kts's
+2. Apply it: `id("com.aaatech.build-tools") version "<see build.gradle.kts's
    `version` in this repo for the current published version>"`. If the app supports
    more than one locale, also set (inside the consumer's own `android { }` block):
    ```kotlin

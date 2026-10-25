@@ -64,7 +64,7 @@ jobs:
       contents: write
       pull-requests: write
     # Every ./gradlew invocation below needs this: app/build.gradle.kts applies the
-    # aaatech.build-tools plugin from aaatechnology/build-tools's GitHub Packages
+    # com.aaatech.build-tools plugin from aaatechnology/build-tools's GitHub Packages
     # registry, which requires auth to resolve even though the repo is public.
     env:
       # Must match gh_packages_read_token's actual owning account (aaatechnology),

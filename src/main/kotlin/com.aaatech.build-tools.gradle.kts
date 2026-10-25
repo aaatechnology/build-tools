@@ -1,4 +1,4 @@
-// Precompiled convention plugin (id "aaatech.build-tools") shared across
+// Precompiled convention plugin (id "com.aaatech.build-tools") shared across
 // every aaatechnology Android app repo. Apply it AFTER com.android.application in the
 // consumer's plugins {} block - it configures the android/androidComponents extensions
 // those plugins expose, so it needs them to already exist.

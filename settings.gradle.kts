@@ -1,1 +1,1 @@
-rootProject.name = "app-conventions-plugin"
+rootProject.name = "build-tools"
