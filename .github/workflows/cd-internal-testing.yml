@@ -40,6 +40,11 @@ on:
         required: false
         type: string
         default: '17'
+      back_merge_branch:
+        description: 'Branch to merge the released commit back into after a successful release (keeps its latest tag and versionCode ahead of main). Empty disables it; skipped if the branch does not exist.'
+        required: false
+        type: string
+        default: 'develop'
     secrets:
       android_keystore_base64:
         required: true
@@ -361,6 +366,45 @@ jobs:
             📝 **Release Notes:**
             ${{ env.RELEASE_NOTES }}
 
+      # main gets a merge commit per release that never flows back to develop on its
+      # own, so develop would neither see the new tag (dev builds stay "<old>.x-dev")
+      # nor out-count main (dev versionCodes collide with release ones). Merging the
+      # released commit back fixes both. Done in a separate worktree so the build
+      # outputs above stay untouched; on a conflict or rejected push (e.g. branch
+      # protection) it opens a PR instead of failing the release.
+      - name: Back-merge into ${{ inputs.back_merge_branch }}
+        id: back_merge
+        if: always() && steps.play_upload.outcome == 'success' && inputs.back_merge_branch != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ inputs.back_merge_branch }}
+        run: |
+          if ! git ls-remote --exit-code --heads origin "$TARGET" >/dev/null 2>&1; then
+            echo "No $TARGET branch - skipping back-merge."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin "$TARGET"
+          WORKTREE="$RUNNER_TEMP/back-merge"
+          git worktree add -B "back-merge-$TARGET" "$WORKTREE" "origin/$TARGET"
+
+          if (cd "$WORKTREE" \
+              && git merge --no-ff --no-edit -m "Back-merge $RELEASE_TAG from main into $TARGET" "${{ github.sha }}" \
+              && git push origin "HEAD:$TARGET"); then
+            echo "BACK_MERGE_STATUS=✅ merged into $TARGET" >> $GITHUB_ENV
+          else
+            (cd "$WORKTREE" && git merge --abort 2>/dev/null || true)
+            PR_URL=$(gh pr create --repo "${{ github.repository }}" \
+              --base "$TARGET" --head "${{ github.ref_name }}" \
+              --title "Back-merge $RELEASE_TAG into $TARGET" \
+              --body "Automatic back-merge after releasing $RELEASE_TAG failed (merge conflict or rejected push). Merge this so $TARGET has the release tag and a versionCode ahead of the release." \
+              2>&1 || true)
+            echo "BACK_MERGE_STATUS=⚠️ automatic merge into $TARGET failed - PR: $PR_URL" >> $GITHUB_ENV
+          fi
+          git worktree remove --force "$WORKTREE" || true
+
       # Reports back on the PR that triggered this release, if one was found.
       - name: Comment release summary on PR
         if: always() && env.PR_NUMBER != ''
@@ -376,6 +420,11 @@ jobs:
             TESTING_LINK=""
             RELEASE_LINK=""
           fi
+          # Only shown when the back-merge actually ran (merged, or fell back to a PR).
+          BACK_MERGE_LINE=""
+          if [ -n "$BACK_MERGE_STATUS" ]; then
+            BACK_MERGE_LINE="🔀 **Back-merge:** $BACK_MERGE_STATUS"
+          fi
           if [ "${{ steps.firebase_release_distribution.outcome }}" = "success" ]; then
             FIREBASE_STATUS="✅ Release build (signed APK) uploaded to Firebase App Distribution - installs instantly, no need to wait on Play Store propagation"
           else
@@ -389,6 +438,7 @@ jobs:
           $PLAY_STATUS
           $TESTING_LINK
           🔥 **Firebase:** $FIREBASE_STATUS
+          $BACK_MERGE_LINE
 
           **Release notes used:**
           $RELEASE_NOTES
