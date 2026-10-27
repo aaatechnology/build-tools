@@ -30,6 +30,11 @@ on:
         required: false
         type: string
         default: 'android-testers'
+      upload_to_firebase:
+        description: 'If false, skip uploading the debug APK to Firebase App Distribution'
+        required: false
+        type: boolean
+        default: true
       java_version:
         description: 'JDK version to build with'
         required: false
@@ -268,6 +273,7 @@ jobs:
 
       - name: Upload Artifact to Firebase App Distribution
         id: firebase_distribution
+        if: inputs.upload_to_firebase
         uses: wzieba/Firebase-Distribution-Github-Action@v1
         with:
           appId: ${{ secrets.firebase_app_id }}
@@ -298,7 +304,9 @@ jobs:
         with:
           script: |
             // Firebase App Distribution link (generic link to console)
-            const firebaseLink = `🔥 **Firebase Distribution:** [Test on Firebase](https://appdistribution.firebase.google.com)`;
+            const firebaseLink = ${{ inputs.upload_to_firebase }}
+              ? `🔥 **Firebase Distribution:** [Test on Firebase](https://appdistribution.firebase.google.com)`
+              : '';
 
             // Build details
             const buildInfo = `
