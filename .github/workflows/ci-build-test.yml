@@ -30,6 +30,11 @@ on:
         required: false
         type: string
         default: 'android-testers'
+      flavor:
+        description: 'Product flavor to build (e.g. "free"); empty for apps without flavors'
+        required: false
+        type: string
+        default: ''
       upload_to_firebase:
         description: 'If false, skip uploading the debug APK to Firebase App Distribution'
         required: false
@@ -76,6 +81,8 @@ jobs:
       # the pair together.
       GITHUB_ACTOR: aaatechnology
       GH_PACKAGES_READ_TOKEN: ${{ secrets.gh_packages_read_token }}
+      # AGP puts a flavored APK under apk/<flavor>/debug instead of apk/debug.
+      DEBUG_APK_DIR: ${{ inputs.flavor != '' && format('app/build/outputs/apk/{0}/debug', inputs.flavor) || 'app/build/outputs/apk/debug' }}
 
     steps:
       # Unifies pull_request and issue_comment ("build-it" PR-comment retrigger)
@@ -136,7 +143,12 @@ jobs:
       # three tasks come from com.aaatech.build-tools (>= 0.8.0) and are safe
       # zero-config no-ops for any module lacking tests or enableUnitTestCoverage.
       - name: Run gradle tests and build debug APK
-        run: ./gradlew moduleJacocoReport combinedJacocoReport listCoverageModules assembleDebug
+        env:
+          FLAVOR: ${{ inputs.flavor }}
+        # Capitalises the flavor: "free" -> assembleFreeDebug, "" -> assembleDebug.
+        run: |
+          VARIANT_FLAVOR="$(printf '%s' "${FLAVOR:0:1}" | tr '[:lower:]' '[:upper:]')${FLAVOR:1}"
+          ./gradlew moduleJacocoReport combinedJacocoReport listCoverageModules "assemble${VARIANT_FLAVOR}Debug"
 
       - name: Parse unit test coverage
         run: |
@@ -204,7 +216,7 @@ jobs:
       # Get the APK file name dynamically
       - name: Get APK file name
         run: |
-          APK_FILE=$(find app/build/outputs/apk/debug -name "*.apk" | head -1)
+          APK_FILE=$(find "$DEBUG_APK_DIR" -name "*.apk" | head -1)
           echo "APK_FILE=$APK_FILE" >> $GITHUB_ENV
           echo "Found APK: $APK_FILE"
 
@@ -252,7 +264,7 @@ jobs:
       # persisted "build number" - there's nothing else to extract here.
       - name: Get version name
         run: |
-          METADATA_FILE=$(find app/build/outputs/apk/debug -name "output-metadata.json" | head -1)
+          METADATA_FILE=$(find "$DEBUG_APK_DIR" -name "output-metadata.json" | head -1)
           if [ -n "$METADATA_FILE" ]; then
             VERSION_NAME=$(jq -r '.elements[0].versionName' "$METADATA_FILE")
             VERSION_CODE=$(jq -r '.elements[0].versionCode' "$METADATA_FILE")
