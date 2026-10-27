@@ -5,7 +5,8 @@
 # that records the shipped version. See this repo's README for the calling pattern.
 #
 # Versioning is git-native: the next version comes from the latest "X.Y.Z" tag plus
-# the release PR's declared "## Version Bump" (major/minor/patch), and versionCode is
+# the release PR's declared "## Version Bump" (major/minor/patch, or "same" to
+# re-release the latest version while its GitHub release is still a draft), and versionCode is
 # the total commit count on this branch (deterministic from any commit, so it's
 # exactly reproducible later from a tag alone - see promote-to-production). There is
 # no version file to keep in sync across branches: any branch can always ask "what's
@@ -120,6 +121,7 @@ jobs:
           PR_BODY=$(echo "$PR_JSON" | jq -r '.body // empty' 2>/dev/null || echo "")
 
           NOTES=""
+          NOTES_FROM_PR=false
           if [ -n "$PR_BODY" ]; then
             NOTES=$(printf '%s\n' "$PR_BODY" \
               | awk '/^## Release Notes/{flag=1; next} /^## /{flag=0} flag' \
@@ -129,6 +131,8 @@ jobs:
 
           if [ -z "$(echo "$NOTES" | tr -d '[:space:]-')" ]; then
             NOTES=$(git log -1 --pretty=%s)
+          else
+            NOTES_FROM_PR=true
           fi
 
           VERSION_BUMP=""
@@ -144,6 +148,7 @@ jobs:
           echo "$NOTES" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
           echo "VERSION_BUMP=$VERSION_BUMP" >> $GITHUB_ENV
+          echo "NOTES_FROM_PR=$NOTES_FROM_PR" >> $GITHUB_ENV
           echo "Version bump requested: ${VERSION_BUMP:-patch (default)}"
 
       # Computed BEFORE building (not read back from the build afterward): the build
@@ -155,7 +160,19 @@ jobs:
         run: |
           LATEST_TAG=$(git describe --tags --match "[0-9]*.[0-9]*.[0-9]*" --abbrev=0 2>/dev/null || echo "")
 
-          if [ -z "$LATEST_TAG" ]; then
+          RERELEASE=false
+          if [ "$VERSION_BUMP" = "same" ]; then
+            # Re-release of the latest version (e.g. a crash fix before it ever reached
+            # production): keep its versionName; versionCode still comes from the commit
+            # count below, so Play accepts the new upload. Guarded in the next step: only
+            # allowed while that version's GitHub release is still a draft.
+            if [ -z "$LATEST_TAG" ]; then
+              echo "::error::Version Bump 'same' needs an existing release tag to re-release."
+              exit 1
+            fi
+            RELEASE_VERSION_NAME="$LATEST_TAG"
+            RERELEASE=true
+          elif [ -z "$LATEST_TAG" ]; then
             # No release has ever been tagged - this is the very first one, so it's
             # 1.0.0 regardless of the declared bump type (there's nothing to bump
             # "from" yet).
@@ -176,7 +193,38 @@ jobs:
 
           echo "RELEASE_VERSION_NAME=$RELEASE_VERSION_NAME" >> $GITHUB_ENV
           echo "RELEASE_TAG=${RELEASE_VERSION_NAME}" >> $GITHUB_ENV
+          echo "RERELEASE=$RERELEASE" >> $GITHUB_ENV
           echo "VERSION_CODE=$(git rev-list --count HEAD)" >> $GITHUB_ENV
+
+      # "same" re-release: refuse if the version's GitHub release was already published
+      # (it may be in production - ship a patch instead), then aggregate release notes:
+      # the draft's existing notes followed by this PR's new ones, duplicate lines
+      # dropped. The tag and draft release are moved/updated after the upload below.
+      - name: Prepare re-release of a draft version
+        if: env.RERELEASE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          IS_DRAFT=$(gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" --json isDraft --jq '.isDraft' 2>/dev/null || echo "")
+          if [ "$IS_DRAFT" != "true" ]; then
+            echo "::error::Release $RELEASE_TAG is not a draft (published or missing) - use a patch bump instead of 'same'."
+            exit 1
+          fi
+
+          PREVIOUS_NOTES=$(gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" --json body --jq '.body')
+          if [ "$NOTES_FROM_PR" = "true" ]; then
+            COMBINED=$(printf '%s\n%s\n' "$PREVIOUS_NOTES" "$RELEASE_NOTES")
+          else
+            # No new notes in the PR (the fallback is just the merge commit subject).
+            COMBINED="$PREVIOUS_NOTES"
+          fi
+          COMBINED=$(printf '%s\n' "$COMBINED" | sed '/^[[:space:]]*$/d' | awk '!seen[$0]++')
+
+          echo "RELEASE_NOTES<<EOF" >> $GITHUB_ENV
+          echo "$COMBINED" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          echo "Re-releasing $RELEASE_TAG with aggregated notes:"
+          echo "$COMBINED"
 
       # Builds both the AAB (for Play Store) and a signed release APK (for Firebase
       # App Distribution) in one invocation - same signing config, same version stamp.
@@ -240,7 +288,11 @@ jobs:
       - name: Push git tag for this release
         if: steps.play_upload.outcome == 'success'
         run: |
-          if git rev-parse "$RELEASE_TAG" >/dev/null 2>&1; then
+          if [ "$RERELEASE" = "true" ]; then
+            # Move the draft version's tag to this rebuilt commit.
+            git tag -f "$RELEASE_TAG" "${{ github.sha }}"
+            git push -f origin "refs/tags/$RELEASE_TAG"
+          elif git rev-parse "$RELEASE_TAG" >/dev/null 2>&1; then
             echo "Tag $RELEASE_TAG already exists, skipping."
           else
             git tag "$RELEASE_TAG" "${{ github.sha }}"
@@ -257,7 +309,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+          if [ "$RERELEASE" = "true" ]; then
+            # Update the existing draft in place: new target, aggregated notes, new assets.
+            gh release edit "$RELEASE_TAG" \
+              --repo "${{ github.repository }}" \
+              --target "${{ github.sha }}" \
+              --notes "$RELEASE_NOTES"
+            gh release upload "$RELEASE_TAG" --repo "${{ github.repository }}" --clobber \
+              app/build/outputs/bundle/release/app-release.aab \
+              app/build/outputs/mapping/release/mapping.txt
+          elif gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "Release $RELEASE_TAG already exists, skipping creation."
           else
             gh release create "$RELEASE_TAG" \
