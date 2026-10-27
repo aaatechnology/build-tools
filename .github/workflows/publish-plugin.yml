@@ -2,6 +2,11 @@
 # GitHub Packages Maven registry, so app repos (e.g. AgeCalculator) can resolve it via
 # plugins { id("com.aaatech.build-tools") version "..." }. GITHUB_TOKEN already has write
 # access to this repo's own packages - no extra secret needed to publish.
+#
+# Each new `version` in build.gradle.kts is also cut as a git tag + GitHub release with
+# the same name (no "v" prefix, e.g. 0.11.0), so app repos can pin the reusable workflows
+# too: uses: aaatechnology/build-tools/.github/workflows/<file>.yml@0.11.0. A push that
+# doesn't bump `version` (e.g. a workflow-only change) publishes nothing and cuts no tag.
 
 name: Publish Build Tools Plugin
 
@@ -13,11 +18,11 @@ on:
       - 'settings.gradle.kts'
       - 'src/**'
       - 'gradle/**'
-      - '.github/workflows/publish-plugin.yml'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 concurrency:
@@ -39,8 +44,40 @@ jobs:
       - name: Change wrapper permissions
         run: chmod +x ./gradlew
 
+      # Packages are immutable per version, so an already-released version can't be
+      # re-published - skip everything until `version` is bumped.
+      - name: Check whether this version is already released
+        id: version
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' build.gradle.kts)
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not read version from build.gradle.kts"
+            exit 1
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          if git ls-remote --exit-code --tags origin "refs/tags/$VERSION" >/dev/null 2>&1; then
+            echo "::notice::$VERSION is already released (tag exists) - nothing published. Bump version in build.gradle.kts to cut a new release."
+            echo "released=true" >> $GITHUB_OUTPUT
+          else
+            echo "released=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Publish to GitHub Packages
+        if: steps.version.outputs.released == 'false'
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./gradlew publish --stacktrace
+
+      # Only after a successful publish, so a tag always means "this version exists in
+      # GitHub Packages" and pins both the plugin and the workflows at this commit.
+      - name: Cut release tag
+        if: steps.version.outputs.released == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git tag "$VERSION" "${{ github.sha }}"
+          git push origin "refs/tags/$VERSION"
+          gh release create "$VERSION" --repo "${{ github.repository }}" \
+            --title "$VERSION" --generate-notes
