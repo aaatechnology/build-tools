@@ -146,9 +146,13 @@ jobs:
         env:
           FLAVOR: ${{ inputs.flavor }}
         # Capitalises the flavor: "free" -> assembleFreeDebug, "" -> assembleDebug.
+        # coverageVariant tells the coverage tasks which unit tests to run and read:
+        # "freeDebug" for a flavored app (it has no testDebugUnitTest), else "debug".
         run: |
           VARIANT_FLAVOR="$(printf '%s' "${FLAVOR:0:1}" | tr '[:lower:]' '[:upper:]')${FLAVOR:1}"
-          ./gradlew moduleJacocoReport combinedJacocoReport listCoverageModules "assemble${VARIANT_FLAVOR}Debug"
+          COVERAGE_VARIANT="${FLAVOR:+${FLAVOR}Debug}"
+          ./gradlew moduleJacocoReport combinedJacocoReport listCoverageModules "assemble${VARIANT_FLAVOR}Debug" \
+            "-PcoverageVariant=${COVERAGE_VARIANT:-debug}"
 
       - name: Parse unit test coverage
         run: |

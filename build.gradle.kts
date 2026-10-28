@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "com.aaatech.buildtools"
-version = "0.13.0"
+version = "0.13.1"
 
 repositories {
     google()

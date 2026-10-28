@@ -228,9 +228,12 @@ the reference consumer.
   classes from AGP's built-in Kotlin compiler output path.
 - A `combinedJacocoReport` task (output under
   `build/reports/jacoco/combinedJacocoReport/`) that works with zero config -
-  auto-discovers and merges every subproject's own separate `debugUnitTest`
-  coverage run into one report, instead of reading each module's number one at a
-  time. No per-module opt-in beyond that: a module that isn't Android/Kotlin, has
+  auto-discovers and merges every subproject's own separate unit-test coverage
+  run into one report, instead of reading each module's number one at a
+  time. The variant defaults to `debug`; an app with product flavors passes
+  `-PcoverageVariant=<flavor>Debug` (e.g. `freeDebug`), which `ci-build-test.yml`
+  does from its `flavor` input, so the right `test<Variant>UnitTest` runs and its
+  Kotlin/Java classes and `.exec` data are read. No per-module opt-in beyond that: a module that isn't Android/Kotlin, has
   no tests, or lacks `android.buildTypes.debug { enableUnitTestCoverage = true }`
   (the same flag this plugin's own per-module Jacoco setup relies on) just
   contributes 0% instead of failing the build - it produces no `.exec`/class data

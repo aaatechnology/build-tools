@@ -169,22 +169,39 @@ val jacocoFileFilter = listOf(
     "**/*Lambda.class", "**/*Lambda*.class", "**/*_LifecycleAdapter.class"
 )
 
+// ---- Coverage variant ---------------------------------------------------------
+// The build variant whose unit tests the coverage tasks run and read: "debug" by
+// default, or e.g. "freeDebug" for an app with product flavors, which has no
+// testDebugUnitTest task and keeps its classes/.exec data under the flavored
+// variant name. Pass -PcoverageVariant=<variant> (ci-build-test.yml does, from its
+// `flavor` input).
+val coverageVariant: String =
+    (findProperty("coverageVariant") as String?)?.takeIf { it.isNotBlank() } ?: "debug"
+val coverageVariantTask = coverageVariant.replaceFirstChar { it.uppercase() }
+val coverageTestTask = "test${coverageVariantTask}UnitTest"
+
+fun coverageKotlinClasses(buildDir: Any) =
+    "$buildDir/intermediates/built_in_kotlinc/$coverageVariant/compile${coverageVariantTask}Kotlin/classes"
+
+fun coverageJavaClasses(buildDir: Any) =
+    "$buildDir/intermediates/javac/$coverageVariant/compile${coverageVariantTask}JavaWithJavac/classes"
+
 fun jacocoClassDirectories() = files(
     // AGP's built-in Kotlin compiler (in effect since removing the separate
     // org.jetbrains.kotlin.android plugin for AGP 9.x compatibility) writes classes
     // here instead of the classic Kotlin Gradle plugin's build/tmp/kotlin-classes/debug.
-    fileTree("${layout.buildDirectory.get()}/intermediates/built_in_kotlinc/debug/compileDebugKotlin/classes") {
+    fileTree(coverageKotlinClasses(layout.buildDirectory.get())) {
         include("**/*.class")
         exclude(jacocoFileFilter)
     },
-    fileTree("${layout.buildDirectory.get()}/intermediates/javac/debug/compileDebugJavaWithJavac/classes") {
+    fileTree(coverageJavaClasses(layout.buildDirectory.get())) {
         include("**/*.class")
         exclude(jacocoFileFilter)
     }
 )
 
 tasks.register<JacocoReport>("jacocoTestReportUnitOnly") {
-    dependsOn("testDebugUnitTest")
+    dependsOn(coverageTestTask)
     reports {
         xml.required.set(true)
         html.required.set(true)
@@ -201,8 +218,8 @@ tasks.register<JacocoReport>("jacocoTestReportUnitOnly") {
     // (surfaced via ci-build-test.yml's coverage PR comment). Both patterns are kept
     // so a project not using enableUnitTestCoverage still finds the classic path.
     executionData.setFrom(fileTree(layout.buildDirectory.get()) {
-        include("jacoco/testDebugUnitTest.exec")
-        include("outputs/unit_test_code_coverage/debugUnitTest/*.exec")
+        include("jacoco/$coverageTestTask.exec")
+        include("outputs/unit_test_code_coverage/${coverageVariant}UnitTest/*.exec")
     })
 }
 
@@ -221,15 +238,22 @@ tasks.register<JacocoReport>("jacocoTestReportUnitOnly") {
 fun moduleSourceDirs(module: Project) =
     listOf(File(module.projectDir, "src/main/java"), File(module.projectDir, "src/main/kotlin"))
 
-fun moduleClassDirs(module: Project) = fileTree(
-    "${module.layout.buildDirectory.get()}/intermediates/built_in_kotlinc/debug/compileDebugKotlin/classes"
-) {
-    include("**/*.class")
-    exclude(jacocoFileFilter)
+// Kotlin and Java classes, so a module still partly in Java is measured in full.
+fun moduleClassDirs(module: Project) = listOf(
+    coverageKotlinClasses(module.layout.buildDirectory.get()),
+    coverageJavaClasses(module.layout.buildDirectory.get()),
+).map { dir ->
+    fileTree(dir) {
+        include("**/*.class")
+        exclude(jacocoFileFilter)
+    }
 }
 
+// AGP's instrumentation (enableUnitTestCoverage) or, without it, the classic
+// jacoco plugin's per-task file - whichever the module produces.
 fun moduleExecData(module: Project) = fileTree(module.layout.buildDirectory.get()) {
-    include("outputs/unit_test_code_coverage/debugUnitTest/*.exec")
+    include("outputs/unit_test_code_coverage/${coverageVariant}UnitTest/*.exec")
+    include("jacoco/$coverageTestTask.exec")
 }
 
 // One report per subproject (registered ON that subproject, not on this app
@@ -242,7 +266,7 @@ project.rootProject.subprojects.forEach { module ->
     module.tasks.register<JacocoReport>("moduleJacocoReport") {
         group = "verification"
         description = "Generates this module's own JaCoCo coverage report."
-        dependsOn(module.tasks.matching { it.name == "testDebugUnitTest" })
+        dependsOn(module.tasks.matching { it.name == coverageTestTask })
 
         reports {
             xml.required.set(true)
@@ -262,7 +286,7 @@ tasks.register<JacocoReport>("combinedJacocoReport") {
     val modules = project.rootProject.subprojects
 
     modules.forEach { module ->
-        dependsOn(module.tasks.matching { it.name == "testDebugUnitTest" })
+        dependsOn(module.tasks.matching { it.name == coverageTestTask })
     }
 
     reports {
@@ -273,7 +297,7 @@ tasks.register<JacocoReport>("combinedJacocoReport") {
     // Every subproject's own build dir, not just this app module's - unlike
     // jacocoClassDirectories()/sourceDirectories above, which are scoped to project.
     sourceDirectories.setFrom(files(modules.flatMap { moduleSourceDirs(it) }))
-    classDirectories.setFrom(files(modules.map { moduleClassDirs(it) }))
+    classDirectories.setFrom(files(modules.flatMap { moduleClassDirs(it) }))
     executionData.setFrom(files(modules.map { moduleExecData(it) }))
 }
 
