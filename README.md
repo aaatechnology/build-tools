@@ -127,6 +127,11 @@ Required secrets on the calling repo: `ANDROID_KEYSTORE_BASE64`,
 omit the `with:` line entirely if you don't have one, rather than passing an empty
 string.
 
+An app with product flavors passes `flavor:` (e.g. `free`) to both this workflow and
+`ci-build-test.yml`: only that flavor is tested (`test<Flavor>DebugUnitTest`), built
+(`bundle<Flavor>Release`/`assemble<Flavor>Release`) and uploaded, from its
+`<flavor>Release` output paths. Leave it out for apps without flavors.
+
 **Versioning is git-native, not file-based.** The calling app's `app/build.gradle.kts`
 must derive `versionCode`/`versionName` from git (see AgeCalculator's for the
 pattern: `git rev-list --count HEAD` for versionCode, `git describe --tags` for

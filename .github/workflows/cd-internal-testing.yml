@@ -40,6 +40,11 @@ on:
         required: false
         type: string
         default: '17'
+      flavor:
+        description: 'Product flavor to release (e.g. "free"); empty for apps without flavors'
+        required: false
+        type: string
+        default: ''
       back_merge_branch:
         description: 'Branch to merge the released commit back into after a successful release (keeps its latest tag and versionCode ahead of main). Empty disables it; skipped if the branch does not exist.'
         required: false
@@ -78,6 +83,12 @@ jobs:
       # the pair together.
       GITHUB_ACTOR: aaatechnology
       GH_PACKAGES_READ_TOKEN: ${{ secrets.gh_packages_read_token }}
+      FLAVOR: ${{ inputs.flavor }}
+      # Release outputs for the selected flavor: a flavored app writes them under
+      # <flavor>Release (e.g. bundle/freeRelease/app-free-release.aab), not release.
+      RELEASE_AAB: ${{ inputs.flavor != '' && format('app/build/outputs/bundle/{0}Release/app-{0}-release.aab', inputs.flavor) || 'app/build/outputs/bundle/release/app-release.aab' }}
+      RELEASE_MAPPING: ${{ inputs.flavor != '' && format('app/build/outputs/mapping/{0}Release/mapping.txt', inputs.flavor) || 'app/build/outputs/mapping/release/mapping.txt' }}
+      RELEASE_APK_DIR: ${{ inputs.flavor != '' && format('app/build/outputs/apk/{0}/release', inputs.flavor) || 'app/build/outputs/apk/release' }}
 
     steps:
       - uses: actions/checkout@v5
@@ -110,8 +121,11 @@ jobs:
           keyPassword=${{ secrets.android_key_password }}
           EOF
 
+      # A flavored app has no testDebugUnitTest ("ambiguous"), only test<Flavor>DebugUnitTest.
       - name: Run gradle tests
-        run: ./gradlew testDebugUnitTest
+        run: |
+          VARIANT_FLAVOR="$(printf '%s' "${FLAVOR:0:1}" | tr '[:lower:]' '[:upper:]')${FLAVOR:1}"
+          ./gradlew "test${VARIANT_FLAVOR}DebugUnitTest"
 
       # Looks up the PR associated with this commit (main only ever moves via merged
       # PRs) and pulls its "## Release Notes" and "## Version Bump" sections. Falls
@@ -237,7 +251,11 @@ jobs:
       # computed above, instead of deriving one itself from git (which it only does
       # for non-release builds - see that file for the full mechanism).
       - name: Build release App Bundle and APK
-        run: ./gradlew bundleRelease assembleRelease -PreleaseVersionName=$RELEASE_VERSION_NAME -PreleaseVersionCode=$VERSION_CODE
+        # Only the selected flavor ("free" -> bundleFreeRelease), or bundleRelease without one.
+        run: |
+          VARIANT_FLAVOR="$(printf '%s' "${FLAVOR:0:1}" | tr '[:lower:]' '[:upper:]')${FLAVOR:1}"
+          ./gradlew "bundle${VARIANT_FLAVOR}Release" "assemble${VARIANT_FLAVOR}Release" \
+            -PreleaseVersionName=$RELEASE_VERSION_NAME -PreleaseVersionCode=$VERSION_CODE
 
       # Uploads via fastlane's upload_to_play_store, not r0adkll/upload-google-play -
       # that action's upload succeeds but then fails at "Committing the Edit" with a
@@ -273,8 +291,8 @@ jobs:
             json_key:play-service-account.json \
             track:internal \
             release_status:completed \
-            aab:app/build/outputs/bundle/release/app-release.aab \
-            mapping:app/build/outputs/mapping/release/mapping.txt \
+            aab:"$RELEASE_AAB" \
+            mapping:"$RELEASE_MAPPING" \
             metadata_path:metadata/android \
             skip_upload_apk:true \
             skip_upload_images:true \
@@ -321,8 +339,8 @@ jobs:
               --target "${{ github.sha }}" \
               --notes "$RELEASE_NOTES"
             gh release upload "$RELEASE_TAG" --repo "${{ github.repository }}" --clobber \
-              app/build/outputs/bundle/release/app-release.aab \
-              app/build/outputs/mapping/release/mapping.txt
+              "$RELEASE_AAB" \
+              "$RELEASE_MAPPING"
           elif gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "Release $RELEASE_TAG already exists, skipping creation."
           else
@@ -332,8 +350,8 @@ jobs:
               --draft \
               --title "$RELEASE_TAG" \
               --notes "$RELEASE_NOTES" \
-              app/build/outputs/bundle/release/app-release.aab \
-              app/build/outputs/mapping/release/mapping.txt
+              "$RELEASE_AAB" \
+              "$RELEASE_MAPPING"
           fi
 
       # Play Store Internal Testing can take a while to propagate to testers' devices.
@@ -341,7 +359,7 @@ jobs:
       # release build (not the debug one) right away, same tester group as debug builds.
       - name: Get release APK file name
         run: |
-          APK_FILE=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
+          APK_FILE=$(find "$RELEASE_APK_DIR" -name "*.apk" | head -1)
           echo "RELEASE_APK_FILE=$APK_FILE" >> $GITHUB_ENV
           echo "Found release APK: $APK_FILE"
 
