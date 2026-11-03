@@ -16,6 +16,7 @@ import com.aaatech.buildtools.enableLog
 import com.aaatech.buildtools.printLog
 import com.android.build.api.dsl.ApplicationExtension
 import com.android.build.api.variant.ApplicationAndroidComponentsExtension
+import groovy.json.JsonSlurper
 import org.gradle.testing.jacoco.plugins.JacocoPluginExtension
 import org.gradle.testing.jacoco.plugins.JacocoTaskExtension
 import org.gradle.testing.jacoco.tasks.JacocoReport
@@ -63,8 +64,28 @@ fun gitVersionName(): String {
     return "$major.$minor.$nextPatch-dev"
 }
 
+// ---- Variants, for printAppInfo ------------------------------------------------
+// One entry per variant, filled in by onVariants below and read by printAppInfo at
+// execution time. The applicationId stays a Provider so suffixes and per-flavour
+// overrides resolve exactly as AGP builds them.
+class VariantInfo(
+    val flavor: String,
+    val buildType: String,
+    val variantName: String,
+    val applicationId: Provider<String>,
+)
+
+val variantInfos = mutableListOf<VariantInfo>()
+
 extensions.configure<ApplicationAndroidComponentsExtension> {
     onVariants { variant ->
+        variantInfos += VariantInfo(
+            flavor = variant.flavorName?.takeIf { it.isNotEmpty() } ?: NO_FLAVOR,
+            buildType = variant.buildType.orEmpty(),
+            variantName = variant.name,
+            applicationId = variant.applicationId,
+        )
+
         val isRelease = variant.buildType == "release"
 
         val versionCode = if (isRelease && project.hasProperty("releaseVersionCode")) {
@@ -173,8 +194,8 @@ val jacocoFileFilter = listOf(
 // The build variant whose unit tests the coverage tasks run and read: "debug" by
 // default, or e.g. "freeDebug" for an app with product flavors, which has no
 // testDebugUnitTest task and keeps its classes/.exec data under the flavored
-// variant name. Pass -PcoverageVariant=<variant> (ci-build-test.yml does, from its
-// `flavor` input).
+// variant name. Pass -PcoverageVariant=<variant> (ci-build-test.yml does, for each
+// flavour it builds, from printAppInfo's <FLAVOR>_DEBUG_VARIANT).
 val coverageVariant: String =
     (findProperty("coverageVariant") as String?)?.takeIf { it.isNotBlank() } ?: "debug"
 val coverageVariantTask = coverageVariant.replaceFirstChar { it.uppercase() }
@@ -320,5 +341,121 @@ tasks.register("listCoverageModules") {
 
     doLast {
         outputFile.get().asFile.writeText(moduleNames.joinToString("\n"))
+    }
+}
+
+// ---- App info for CI/CD (printAppInfo) ----------------------------------------------
+// The CI/CD workflows ask Gradle, not their own inputs, what the app is made of: each
+// selected flavour's applicationId, Firebase app ID, task names and output paths, as
+// KEY=value lines a workflow appends to $GITHUB_ENV:
+//
+//   ./gradlew -q printAppInfo -PappFlavors=all
+//
+//   APP_FLAVORS=free pro
+//   FREE_APPLICATION_ID=com.example.app
+//   FREE_FIREBASE_APP_ID=1:123:android:abc      (from google-services.json, when it has the package)
+//   FREE_DEBUG_ASSEMBLE_TASK=assembleFreeDebug
+//   FREE_DEBUG_TEST_TASK=testFreeDebugUnitTest
+//   FREE_DEBUG_VARIANT=freeDebug                 (coverageVariant)
+//   FREE_DEBUG_APK_DIR=app/build/outputs/apk/free/debug
+//   FREE_RELEASE_BUNDLE_TASK=bundleFreeRelease
+//   FREE_RELEASE_ASSEMBLE_TASK=assembleFreeRelease
+//   FREE_RELEASE_BUNDLE_DIR=app/build/outputs/bundle/freeRelease
+//   FREE_RELEASE_APK_DIR=app/build/outputs/apk/free/release
+//   FREE_RELEASE_MAPPING=app/build/outputs/mapping/freeRelease/mapping.txt
+//
+// An app without product flavours has exactly one flavour, named "default" (never an
+// empty string): DEFAULT_APPLICATION_ID, DEFAULT_DEBUG_ASSEMBLE_TASK=assembleDebug, ...
+//
+// -PappFlavors is "all" (every flavour, the default) or a comma/space-separated list.
+// The task fails, before anything is built, when a requested flavour doesn't exist, a
+// real flavour is named "default", or google-services.json is present but has no client
+// for a selected flavour's applicationId (its Firebase upload would go to the wrong app).
+
+/** The flavour name standing for "no product flavours". */
+val NO_FLAVOR = "default"
+
+/** FREE for "free", FREE_PROD for "freeProd": the prefix of a flavour's variables. */
+fun flavorKey(flavor: String): String =
+    flavor.replace(Regex("([a-z0-9])([A-Z])"), "$1_$2").replace(Regex("[^A-Za-z0-9]"), "_").uppercase()
+
+tasks.register("printAppInfo") {
+    group = "help"
+    description = "Prints each selected flavour's applicationId, Firebase app ID, tasks and outputs for CI/CD."
+
+    val requested = (findProperty("appFlavors") as String?)?.takeIf { it.isNotBlank() } ?: "all"
+    val moduleDir = project.rootDir.toPath().relativize(project.projectDir.toPath()).toString().ifEmpty { "." }
+    val projectDirFile = project.projectDir
+    val infos = variantInfos
+
+    doLast {
+        val flavors = infos.map { it.flavor }.distinct()
+        if (infos.any { it.flavor == NO_FLAVOR } && flavors.size > 1) {
+            throw GradleException("A product flavour is named \"$NO_FLAVOR\", which stands for \"no flavours\" in CI/CD. Rename it.")
+        }
+
+        val selected = if (requested.trim() == "all") {
+            flavors
+        } else {
+            requested.split(',', ' ').map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        }
+        val unknown = selected - flavors.toSet()
+        if (unknown.isNotEmpty()) {
+            throw GradleException("Unknown flavour(s) ${unknown.joinToString()}: this app has ${flavors.joinToString()}.")
+        }
+        if (selected.isEmpty()) throw GradleException("No flavours selected (-PappFlavors=$requested).")
+
+        // Firebase clients: a flavour's own src/<flavor>/google-services.json, else the module's.
+        fun firebaseClients(flavor: String): Map<String, String>? {
+            val file = listOf(File(projectDirFile, "src/$flavor/google-services.json"), File(projectDirFile, "google-services.json"))
+                .firstOrNull { it.isFile } ?: return null
+            @Suppress("UNCHECKED_CAST")
+            val json = JsonSlurper().parse(file) as Map<String, Any?>
+            @Suppress("UNCHECKED_CAST")
+            val clients = json["client"] as? List<Map<String, Any?>> ?: return emptyMap()
+            return clients.mapNotNull { client ->
+                @Suppress("UNCHECKED_CAST")
+                val info = client["client_info"] as? Map<String, Any?> ?: return@mapNotNull null
+                @Suppress("UNCHECKED_CAST")
+                val pkg = (info["android_client_info"] as? Map<String, Any?>)?.get("package_name") as? String
+                val appId = info["mobilesdk_app_id"] as? String
+                if (pkg != null && appId != null) pkg to appId else null
+            }.toMap()
+        }
+
+        val lines = mutableListOf("APP_FLAVORS=${selected.joinToString(" ")}")
+        for (flavor in selected) {
+            val key = flavorKey(flavor)
+            val debug = infos.firstOrNull { it.flavor == flavor && it.buildType == "debug" }
+            val release = infos.firstOrNull { it.flavor == flavor && it.buildType == "release" }
+            val applicationId = (release ?: debug ?: infos.first { it.flavor == flavor }).applicationId.get()
+            lines += "${key}_APPLICATION_ID=$applicationId"
+
+            firebaseClients(flavor)?.let { clients ->
+                val appId = clients[applicationId]
+                    ?: throw GradleException("google-services.json has no client for $applicationId (flavour $flavor). Add the app in Firebase and download the file again.")
+                lines += "${key}_FIREBASE_APP_ID=$appId"
+            }
+
+            // AGP's output layout: apk/<flavor>/<buildType> (apk/<buildType> without flavours),
+            // bundle/<variant>, mapping/<variant>.
+            val apkFlavorDir = if (flavor == NO_FLAVOR) "" else "$flavor/"
+            debug?.let { v ->
+                val cap = v.variantName.replaceFirstChar { it.uppercase() }
+                lines += "${key}_DEBUG_ASSEMBLE_TASK=assemble$cap"
+                lines += "${key}_DEBUG_TEST_TASK=test${cap}UnitTest"
+                lines += "${key}_DEBUG_VARIANT=${v.variantName}"
+                lines += "${key}_DEBUG_APK_DIR=$moduleDir/build/outputs/apk/${apkFlavorDir}debug"
+            }
+            release?.let { v ->
+                val cap = v.variantName.replaceFirstChar { it.uppercase() }
+                lines += "${key}_RELEASE_BUNDLE_TASK=bundle$cap"
+                lines += "${key}_RELEASE_ASSEMBLE_TASK=assemble$cap"
+                lines += "${key}_RELEASE_BUNDLE_DIR=$moduleDir/build/outputs/bundle/${v.variantName}"
+                lines += "${key}_RELEASE_APK_DIR=$moduleDir/build/outputs/apk/${apkFlavorDir}release"
+                lines += "${key}_RELEASE_MAPPING=$moduleDir/build/outputs/mapping/${v.variantName}/mapping.txt"
+            }
+        }
+        lines.forEach { println(it) }
     }
 }

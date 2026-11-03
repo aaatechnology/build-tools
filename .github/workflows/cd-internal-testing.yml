@@ -1,8 +1,15 @@
-# Reusable release workflow shared across aaatechnology Android app repos: builds a
-# signed release App Bundle + APK, uploads the AAB to Play Store Internal Testing,
-# uploads the release APK to Firebase App Distribution, and - only once that Play
-# Store upload is confirmed successful - creates the git tag + draft GitHub release
-# that records the shipped version. See this repo's README for the calling pattern.
+# Reusable release workflow shared across aaatechnology Android app repos: for each
+# selected product flavour, builds a signed release App Bundle + APK, uploads the AAB to
+# that flavour's own Play Store package on Internal Testing, uploads the release APK to
+# its Firebase app, and - only once every flavour's Play Store upload is confirmed - creates
+# the git tag + draft GitHub release that records the shipped version (one version for all
+# flavours). See this repo's README for the calling pattern.
+#
+# Flavours: `flavors` is "all" (every flavour the app has) or a comma/space-separated list.
+# Package names, Firebase app IDs, task names and output paths come from the
+# com.aaatech.build-tools plugin's printAppInfo task (>= 0.14.0); an app without flavours
+# has exactly one, named "default". A re-run skips any flavour whose versionCode is
+# already on Internal Testing, so a release that failed for one flavour can be finished.
 #
 # Versioning is git-native: the next version comes from the latest "X.Y.Z" tag plus
 # the release PR's declared "## Version Bump" (major/minor/patch, or "same" to
@@ -21,10 +28,6 @@ on:
         description: 'Display name used in Firebase release notes (e.g. "Age Calculator")'
         required: true
         type: string
-      package_name:
-        description: 'Android application ID to upload to Play Store (e.g. com.arun.agecalculator)'
-        required: true
-        type: string
       firebase_testers_group:
         description: 'Firebase App Distribution tester group to distribute release builds to'
         required: false
@@ -40,11 +43,11 @@ on:
         required: false
         type: string
         default: '17'
-      flavor:
-        description: 'Product flavor to release (e.g. "free"); empty for apps without flavors'
+      flavors:
+        description: 'Flavours to release: "all" (every flavour; "default" for an app without flavours) or a comma/space-separated list like "free,pro"'
         required: false
         type: string
-        default: ''
+        default: 'all'
       back_merge_branch:
         description: 'Branch to merge the released commit back into after a successful release (keeps its latest tag and versionCode ahead of main). Empty disables it; skipped if the branch does not exist.'
         required: false
@@ -61,8 +64,10 @@ on:
         required: true
       play_service_account_json:
         required: true
+      # Only a fallback for an app with one flavour and no google-services.json: each
+      # flavour's Firebase app ID normally comes from google-services.json (printAppInfo).
       firebase_app_id:
-        required: true
+        required: false
       credential_file_content:
         required: true
       gh_packages_read_token:
@@ -83,12 +88,12 @@ jobs:
       # the pair together.
       GITHUB_ACTOR: aaatechnology
       GH_PACKAGES_READ_TOKEN: ${{ secrets.gh_packages_read_token }}
-      FLAVOR: ${{ inputs.flavor }}
-      # Release outputs for the selected flavor: a flavored app writes them under
-      # <flavor>Release (e.g. bundle/freeRelease/app-free-release.aab), not release.
-      RELEASE_AAB: ${{ inputs.flavor != '' && format('app/build/outputs/bundle/{0}Release/app-{0}-release.aab', inputs.flavor) || 'app/build/outputs/bundle/release/app-release.aab' }}
-      RELEASE_MAPPING: ${{ inputs.flavor != '' && format('app/build/outputs/mapping/{0}Release/mapping.txt', inputs.flavor) || 'app/build/outputs/mapping/release/mapping.txt' }}
-      RELEASE_APK_DIR: ${{ inputs.flavor != '' && format('app/build/outputs/apk/{0}/release', inputs.flavor) || 'app/build/outputs/apk/release' }}
+      # Per-flavour results (Play / Firebase status), one folder each.
+      FLAVOR_RESULTS: ${{ github.workspace }}/../flavor-results
+      # Release assets for the GitHub release: each flavour's AAB and mapping file.
+      RELEASE_ASSETS: ${{ github.workspace }}/../release-assets
+      # fastlane's output is parsed below (track version codes); no colour codes in it.
+      FASTLANE_DISABLE_COLORS: '1'
 
     steps:
       - uses: actions/checkout@v5
@@ -121,11 +126,32 @@ jobs:
           keyPassword=${{ secrets.android_key_password }}
           EOF
 
-      # A flavored app has no testDebugUnitTest ("ambiguous"), only test<Flavor>DebugUnitTest.
-      - name: Run gradle tests
+      # Asks Gradle for each selected flavour's package, Firebase app ID, task names and
+      # output paths, as KEY=value lines (APP_FLAVORS, FREE_APPLICATION_ID, ...) added to the
+      # environment. Fails here, before building, on an unknown flavour. Gradle's JVM also
+      # prints WARNING lines, hence the filter.
+      - name: Read the app's flavours from Gradle
+        shell: bash
+        env:
+          FLAVORS: ${{ inputs.flavors }}
         run: |
-          VARIANT_FLAVOR="$(printf '%s' "${FLAVOR:0:1}" | tr '[:lower:]' '[:upper:]')${FLAVOR:1}"
-          ./gradlew "test${VARIANT_FLAVOR}DebugUnitTest"
+          ./gradlew -q printAppInfo "-PappFlavors=$FLAVORS" > "$RUNNER_TEMP/app-info.txt"
+          grep -E '^[A-Z0-9_]+=' "$RUNNER_TEMP/app-info.txt" | tee -a "$GITHUB_ENV"
+
+      # Each flavour's debug unit tests (a flavoured app has no testDebugUnitTest, only
+      # test<Flavor>DebugUnitTest), in one Gradle invocation.
+      - name: Run gradle tests
+        shell: bash
+        run: |
+          var() {
+            local key
+            key=$(printf '%s' "$1" | sed -E 's/([a-z0-9])([A-Z])/\1_\2/g; s/[^A-Za-z0-9]/_/g' | tr '[:lower:]' '[:upper:]')
+            local name="${key}_$2"
+            printf '%s' "${!name}"
+          }
+          TASKS=()
+          for FLAVOR in $APP_FLAVORS; do TASKS+=("$(var "$FLAVOR" DEBUG_TEST_TASK)"); done
+          ./gradlew "${TASKS[@]}"
 
       # Looks up the PR associated with this commit (main only ever moves via merged
       # PRs) and pulls its "## Release Notes" and "## Version Bump" sections. Falls
@@ -250,12 +276,41 @@ jobs:
       # The explicit -P flags are what make app/build.gradle.kts embed the version
       # computed above, instead of deriving one itself from git (which it only does
       # for non-release builds - see that file for the full mechanism).
-      - name: Build release App Bundle and APK
-        # Only the selected flavor ("free" -> bundleFreeRelease), or bundleRelease without one.
+      - name: Build release App Bundles and APKs
+        # Every selected flavour ("free" -> bundleFreeRelease, assembleFreeRelease), all with
+        # the same version. Each flavour's AAB and mapping are then collected for the
+        # GitHub release (the mapping renamed per flavour, as they're all "mapping.txt").
+        shell: bash
         run: |
-          VARIANT_FLAVOR="$(printf '%s' "${FLAVOR:0:1}" | tr '[:lower:]' '[:upper:]')${FLAVOR:1}"
-          ./gradlew "bundle${VARIANT_FLAVOR}Release" "assemble${VARIANT_FLAVOR}Release" \
+          var() {
+            local key
+            key=$(printf '%s' "$1" | sed -E 's/([a-z0-9])([A-Z])/\1_\2/g; s/[^A-Za-z0-9]/_/g' | tr '[:lower:]' '[:upper:]')
+            local name="${key}_$2"
+            printf '%s' "${!name}"
+          }
+          TASKS=()
+          for FLAVOR in $APP_FLAVORS; do
+            TASKS+=("$(var "$FLAVOR" RELEASE_BUNDLE_TASK)" "$(var "$FLAVOR" RELEASE_ASSEMBLE_TASK)")
+          done
+          ./gradlew "${TASKS[@]}" \
             -PreleaseVersionName=$RELEASE_VERSION_NAME -PreleaseVersionCode=$VERSION_CODE
+
+          mkdir -p "$RELEASE_ASSETS"
+          for FLAVOR in $APP_FLAVORS; do
+            OUT="$FLAVOR_RESULTS/$FLAVOR"
+            mkdir -p "$OUT"
+            AAB=$(find "$(var "$FLAVOR" RELEASE_BUNDLE_DIR)" -name "*.aab" | head -1)
+            APK=$(find "$(var "$FLAVOR" RELEASE_APK_DIR)" -name "*.apk" | head -1)
+            echo "$AAB" > "$OUT/aab"
+            echo "$APK" > "$OUT/apk"
+            cp "$AAB" "$RELEASE_ASSETS/"
+            MAPPING="$(var "$FLAVOR" RELEASE_MAPPING)"
+            if [ -f "$MAPPING" ]; then
+              if [ "$FLAVOR" = "default" ]; then cp "$MAPPING" "$RELEASE_ASSETS/mapping.txt"
+              else cp "$MAPPING" "$RELEASE_ASSETS/mapping-$FLAVOR.txt"; fi
+            fi
+            echo "$FLAVOR: $AAB, $APK"
+          done
 
       # Uploads via fastlane's upload_to_play_store, not r0adkll/upload-google-play -
       # that action's upload succeeds but then fails at "Committing the Edit" with a
@@ -283,20 +338,56 @@ jobs:
           mkdir -p "metadata/android/en-US/changelogs"
           printf '%s' "$RELEASE_NOTES" | head -c 500 > "metadata/android/en-US/changelogs/${VERSION_CODE}.txt"
 
+      # One upload per flavour, each to its own package. A flavour whose versionCode is
+      # already on Internal Testing is skipped (a re-run after another flavour failed: Play
+      # rejects a second upload of the same versionCode). Every flavour is tried; the step
+      # fails afterwards if any didn't make it, so no tag or release is created for a
+      # half-shipped version - re-run to finish it.
       - name: Upload to Play Store (Internal Testing)
         id: play_upload
+        shell: bash
         run: |
-          fastlane run upload_to_play_store \
-            package_name:${{ inputs.package_name }} \
-            json_key:play-service-account.json \
-            track:internal \
-            release_status:completed \
-            aab:"$RELEASE_AAB" \
-            mapping:"$RELEASE_MAPPING" \
-            metadata_path:metadata/android \
-            skip_upload_apk:true \
-            skip_upload_images:true \
-            skip_upload_screenshots:true
+          var() {
+            local key
+            key=$(printf '%s' "$1" | sed -E 's/([a-z0-9])([A-Z])/\1_\2/g; s/[^A-Za-z0-9]/_/g' | tr '[:lower:]' '[:upper:]')
+            local name="${key}_$2"
+            printf '%s' "${!name}"
+          }
+          # The version codes on a package's track, one per line (none if it has none yet).
+          track_codes() {
+            fastlane run google_play_track_version_codes package_name:"$1" json_key:play-service-account.json track:"$2" 2>&1 \
+              | sed -n 's/.*Result: \[\(.*\)\].*/\1/p' | tail -1 | tr ',' '\n' | tr -d ' ' | grep -E '^[0-9]+$' || true
+          }
+
+          ALL_UPLOADED=true
+          for FLAVOR in $APP_FLAVORS; do
+            OUT="$FLAVOR_RESULTS/$FLAVOR"
+            PACKAGE="$(var "$FLAVOR" APPLICATION_ID)"
+            if track_codes "$PACKAGE" internal | grep -qx "$VERSION_CODE"; then
+              echo "✅ already on Internal Testing ($PACKAGE)" > "$OUT/play"
+              continue
+            fi
+            MAPPING="$(var "$FLAVOR" RELEASE_MAPPING)"
+            MAPPING_ARG=()
+            [ -f "$MAPPING" ] && MAPPING_ARG=(mapping:"$MAPPING")
+            if fastlane run upload_to_play_store \
+                package_name:"$PACKAGE" \
+                json_key:play-service-account.json \
+                track:internal \
+                release_status:completed \
+                aab:"$(cat "$OUT/aab")" \
+                "${MAPPING_ARG[@]}" \
+                metadata_path:metadata/android \
+                skip_upload_apk:true \
+                skip_upload_images:true \
+                skip_upload_screenshots:true; then
+              echo "✅ uploaded to Internal Testing ($PACKAGE)" > "$OUT/play"
+            else
+              echo "❌ upload failed ($PACKAGE) - check the workflow run, then re-run to finish" > "$OUT/play"
+              ALL_UPLOADED=false
+            fi
+          done
+          [ "$ALL_UPLOADED" = true ]
 
       - name: Remove Play service account key
         if: always()
@@ -329,6 +420,7 @@ jobs:
       - name: Create draft GitHub release
         id: gh_release
         if: steps.play_upload.outcome == 'success'
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -339,8 +431,7 @@ jobs:
               --target "${{ github.sha }}" \
               --notes "$RELEASE_NOTES"
             gh release upload "$RELEASE_TAG" --repo "${{ github.repository }}" --clobber \
-              "$RELEASE_AAB" \
-              "$RELEASE_MAPPING"
+              "$RELEASE_ASSETS"/*
           elif gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "Release $RELEASE_TAG already exists, skipping creation."
           else
@@ -350,39 +441,74 @@ jobs:
               --draft \
               --title "$RELEASE_TAG" \
               --notes "$RELEASE_NOTES" \
-              "$RELEASE_AAB" \
-              "$RELEASE_MAPPING"
+              "$RELEASE_ASSETS"/*
           fi
 
       # Play Store Internal Testing can take a while to propagate to testers' devices.
       # Firebase App Distribution installs instantly, so testers can get the real signed
-      # release build (not the debug one) right away, same tester group as debug builds.
-      - name: Get release APK file name
-        run: |
-          APK_FILE=$(find "$RELEASE_APK_DIR" -name "*.apk" | head -1)
-          echo "RELEASE_APK_FILE=$APK_FILE" >> $GITHUB_ENV
-          echo "Found release APK: $APK_FILE"
-
-      - name: Upload release APK to Firebase App Distribution
+      # release build (not the debug one) right away, same tester group as debug builds -
+      # each flavour to its own Firebase app (from google-services.json via printAppInfo;
+      # the firebase_app_id secret only for a single flavour without that file).
+      - name: Upload release APKs to Firebase App Distribution
         id: firebase_release_distribution
-        uses: wzieba/Firebase-Distribution-Github-Action@v1
-        with:
-          appId: ${{ secrets.firebase_app_id }}
-          serviceCredentialsFileContent: ${{ secrets.credential_file_content }}
-          groups: ${{ inputs.firebase_testers_group }}
-          file: ${{ env.RELEASE_APK_FILE }}
-          releaseNotes: |
-            🚀 ${{ inputs.app_display_name }} ${{ env.RELEASE_TAG }} (Release)
+        shell: bash
+        env:
+          CREDENTIALS: ${{ secrets.credential_file_content }}
+          FALLBACK_APP_ID: ${{ secrets.firebase_app_id }}
+          GROUP: ${{ inputs.firebase_testers_group }}
+          DISPLAY_NAME: ${{ inputs.app_display_name }}
+        run: |
+          var() {
+            local key
+            key=$(printf '%s' "$1" | sed -E 's/([a-z0-9])([A-Z])/\1_\2/g; s/[^A-Za-z0-9]/_/g' | tr '[:lower:]' '[:upper:]')
+            local name="${key}_$2"
+            printf '%s' "${!name}"
+          }
 
-            This is the real signed release build - same code going to Play Store
-            Internal Testing, available here immediately instead of waiting on Play
-            Store propagation.
+          npm install -g firebase-tools >/dev/null 2>&1
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/firebase-sa.json"
+          printf '%s' "$CREDENTIALS" > "$GOOGLE_APPLICATION_CREDENTIALS"
 
-            📋 **Build Details:**
-            - Version: ${{ env.RELEASE_TAG }}, Version Code: ${{ env.VERSION_CODE }}
+          FLAVOR_COUNT=$(wc -w <<< "$APP_FLAVORS")
+          FAILED=false
+          for FLAVOR in $APP_FLAVORS; do
+            OUT="$FLAVOR_RESULTS/$FLAVOR"
+            APP_ID="$(var "$FLAVOR" FIREBASE_APP_ID)"
+            if [ -z "$APP_ID" ] && [ "$FLAVOR_COUNT" -eq 1 ]; then
+              APP_ID="$FALLBACK_APP_ID"
+            fi
+            if [ -z "$APP_ID" ]; then
+              echo "⚠️ not uploaded: no Firebase app for $(var "$FLAVOR" APPLICATION_ID) in google-services.json" > "$OUT/firebase"
+              FAILED=true
+              continue
+            fi
 
-            📝 **Release Notes:**
-            ${{ env.RELEASE_NOTES }}
+            LABEL="$DISPLAY_NAME"
+            [ "$FLAVOR" != "default" ] && LABEL="$DISPLAY_NAME ($FLAVOR)"
+            cat > "$OUT/notes.txt" <<NOTES
+          🚀 $LABEL $RELEASE_TAG (Release)
+
+          This is the real signed release build - same code going to Play Store
+          Internal Testing, available here immediately instead of waiting on Play
+          Store propagation.
+
+          📋 Build Details:
+          - Version: $RELEASE_TAG, Version Code: $VERSION_CODE
+
+          📝 Release Notes:
+          $RELEASE_NOTES
+          NOTES
+
+            if firebase appdistribution:distribute "$(cat "$OUT/apk")" --app "$APP_ID" \
+                --groups "$GROUP" --release-notes-file "$OUT/notes.txt"; then
+              echo "✅ release APK uploaded - installs instantly, no need to wait on Play Store propagation" > "$OUT/firebase"
+            else
+              echo "❌ upload failed - check the workflow run" > "$OUT/firebase"
+              FAILED=true
+            fi
+          done
+          rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
+          [ "$FAILED" = false ]
 
       # main gets a merge commit per release that never flows back to develop on its
       # own, so develop would neither see the new tag (dev builds stay "<old>.x-dev")
@@ -426,42 +552,47 @@ jobs:
       # Reports back on the PR that triggered this release, if one was found.
       - name: Comment release summary on PR
         if: always() && env.PR_NUMBER != ''
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "${{ steps.play_upload.outcome }}" = "success" ]; then
-            PLAY_STATUS="✅ Uploaded to Play Store Internal Testing"
-            TESTING_LINK="${{ inputs.play_internal_testing_link != '' && format('🔗 **Test it:** {0}', inputs.play_internal_testing_link) || '' }}"
-            RELEASE_LINK="📦 **GitHub release (draft):** ${{ github.server_url }}/${{ github.repository }}/releases/tag/$RELEASE_TAG"
-          else
-            PLAY_STATUS="❌ Play Store upload failed - check the workflow run"
-            TESTING_LINK=""
-            RELEASE_LINK=""
-          fi
-          # Only shown when the back-merge actually ran (merged, or fell back to a PR).
-          BACK_MERGE_LINE=""
-          if [ -n "$BACK_MERGE_STATUS" ]; then
-            BACK_MERGE_LINE="🔀 **Back-merge:** $BACK_MERGE_STATUS"
-          fi
-          if [ "${{ steps.firebase_release_distribution.outcome }}" = "success" ]; then
-            FIREBASE_STATUS="✅ Release build (signed APK) uploaded to Firebase App Distribution - installs instantly, no need to wait on Play Store propagation"
-          else
-            FIREBASE_STATUS="❌ Firebase App Distribution upload failed - check the workflow run"
-          fi
-          gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body "$(cat <<COMMENT
-          ## 🚀 Release $RELEASE_TAG
+          var() {
+            local key
+            key=$(printf '%s' "$1" | sed -E 's/([a-z0-9])([A-Z])/\1_\2/g; s/[^A-Za-z0-9]/_/g' | tr '[:lower:]' '[:upper:]')
+            local name="${key}_$2"
+            printf '%s' "${!name}"
+          }
 
-          **Version:** $RELEASE_TAG, Version Code: $VERSION_CODE
-          $RELEASE_LINK
-          $PLAY_STATUS
-          $TESTING_LINK
-          🔥 **Firebase:** $FIREBASE_STATUS
-          $BACK_MERGE_LINE
-
-          **Release notes used:**
-          $RELEASE_NOTES
-
-          ---
-          *Generated by the Release to Play Store workflow.*
-          COMMENT
-          )"
+          BODY="$RUNNER_TEMP/release-comment.md"
+          {
+            echo "## 🚀 Release $RELEASE_TAG"
+            echo
+            echo "**Version:** $RELEASE_TAG, Version Code: $VERSION_CODE"
+            if [ "${{ steps.play_upload.outcome }}" = "success" ]; then
+              echo "📦 **GitHub release (draft):** ${{ github.server_url }}/${{ github.repository }}/releases/tag/$RELEASE_TAG"
+              if [ -n "${{ inputs.play_internal_testing_link }}" ]; then
+                echo "🔗 **Test it:** ${{ inputs.play_internal_testing_link }}"
+              fi
+            else
+              echo "⚠️ Not every flavour reached Play Store, so no tag or GitHub release was created - re-run to finish (flavours already uploaded are skipped)."
+            fi
+            echo
+            for FLAVOR in $APP_FLAVORS; do
+              OUT="$FLAVOR_RESULTS/$FLAVOR"
+              if [ "$FLAVOR" = "default" ]; then echo "### 📱 $(var "$FLAVOR" APPLICATION_ID)"
+              else echo "### 📱 $FLAVOR · $(var "$FLAVOR" APPLICATION_ID)"; fi
+              echo "- **Play Store:** $(cat "$OUT/play" 2>/dev/null || echo '❌ not uploaded - check the workflow run')"
+              echo "- **Firebase:** $(cat "$OUT/firebase" 2>/dev/null || echo '❌ not uploaded - check the workflow run')"
+              echo
+            done
+            if [ -n "$BACK_MERGE_STATUS" ]; then
+              echo "🔀 **Back-merge:** $BACK_MERGE_STATUS"
+              echo
+            fi
+            echo "**Release notes used:**"
+            echo "$RELEASE_NOTES"
+            echo
+            echo "---"
+            echo "*Generated by the Release to Play Store workflow.*"
+          } > "$BODY"
+          gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body-file "$BODY"

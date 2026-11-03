@@ -3,22 +3,36 @@
 # track straight to Production - no rebuild, no re-upload, just a track move via
 # the Play Developer API (through fastlane's `upload_to_play_store` action). See
 # this repo's README for the calling pattern.
+#
+# Flavours: `flavors` is "all" (every flavour the app has) or a comma/space-separated list;
+# each flavour's package comes from the com.aaatech.build-tools plugin's printAppInfo task
+# (>= 0.14.0), and an app without flavours has one, named "default". A flavour is only
+# promoted when its newest Internal Testing versionCode is higher than Production's - one
+# already in Production is reported and left alone.
 
 name: Android Promote to Production (reusable)
 
 on:
   workflow_call:
     inputs:
-      package_name:
-        description: 'Android application ID on Play Store (e.g. com.arun.agecalculator)'
-        required: true
+      flavors:
+        description: 'Flavours to promote: "all" (every flavour; "default" for an app without flavours) or a comma/space-separated list like "free,pro"'
+        required: false
         type: string
+        default: 'all'
+      java_version:
+        description: 'JDK version to run Gradle with (to read the flavours)'
+        required: false
+        type: string
+        default: '17'
       rollout_percentage:
         description: 'Percent of users to roll out to (1-100). Less than 100 starts a staged rollout.'
         required: true
         type: string
     secrets:
       play_service_account_json:
+        required: true
+      gh_packages_read_token:
         required: true
 
 jobs:
@@ -60,6 +74,15 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      summary: ${{ steps.promote.outputs.summary }}
+    # ./gradlew (printAppInfo) applies com.aaatech.build-tools from GitHub Packages, which
+    # needs auth even though the repo is public.
+    env:
+      GITHUB_ACTOR: aaatechnology
+      GH_PACKAGES_READ_TOKEN: ${{ secrets.gh_packages_read_token }}
+      # fastlane's output is parsed below (track version codes); no colour codes in it.
+      FASTLANE_DISABLE_COLORS: '1'
 
     steps:
       - uses: actions/checkout@v5
@@ -67,6 +90,26 @@ jobs:
           # Full history + tags: resolving "the latest release" (when not run from an
           # explicit tag ref) and computing its versionCode both need full depth.
           fetch-depth: 0
+
+      - name: Set Up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: ${{ inputs.java_version }}
+          cache: 'gradle'
+
+      - name: Change wrapper permissions
+        run: chmod +x ./gradlew
+
+      # Each selected flavour's package (FREE_APPLICATION_ID, ...) from Gradle, added to the
+      # environment. Fails here on an unknown flavour.
+      - name: Read the app's flavours from Gradle
+        shell: bash
+        env:
+          FLAVORS: ${{ inputs.flavors }}
+        run: |
+          ./gradlew -q printAppInfo "-PappFlavors=$FLAVORS" > "$RUNNER_TEMP/app-info.txt"
+          grep -E '^[A-Z0-9_]+=' "$RUNNER_TEMP/app-info.txt" | tee -a "$GITHUB_ENV"
 
       # Only used afterward to un-draft the matching GitHub release - the actual Play
       # Store promotion below never needs this, it promotes whatever's live on the
@@ -94,16 +137,31 @@ jobs:
           PLAY_JSON: ${{ secrets.play_service_account_json }}
         run: printf '%s' "$PLAY_JSON" > play-service-account.json
 
-      # rollout=100 must use status "completed" - the Play API rejects userFraction=1.0
-      # under "inProgress". Anything less starts a real staged rollout.
-      #
-      # No version_code passed: fastlane's promote_track defaults to whatever's
-      # currently active on the source track when it's omitted, so this always
-      # promotes the real live internal release regardless of git tag state.
-      - name: Promote Internal Testing build to Production
+      # Per flavour: compares the newest versionCode on Internal Testing with Production's
+      # and promotes only when Internal is newer (anything else is already live, or there's
+      # nothing to promote). rollout=100 must use status "completed" - the Play API rejects
+      # userFraction=1.0 under "inProgress"; anything less starts a real staged rollout. No
+      # version_code is passed: fastlane promotes whatever is active on the source track.
+      # Every flavour is tried; a later step fails the job if any promotion failed.
+      - name: Promote Internal Testing builds to Production
+        id: promote
+        shell: bash
         env:
           ROLLOUT_PCT: ${{ inputs.rollout_percentage }}
         run: |
+          var() {
+            local key
+            key=$(printf '%s' "$1" | sed -E 's/([a-z0-9])([A-Z])/\1_\2/g; s/[^A-Za-z0-9]/_/g' | tr '[:lower:]' '[:upper:]')
+            local name="${key}_$2"
+            printf '%s' "${!name}"
+          }
+          # The newest versionCode on a package's track, or 0 when it has none.
+          newest_code() {
+            fastlane run google_play_track_version_codes package_name:"$1" json_key:play-service-account.json track:"$2" 2>&1 \
+              | sed -n 's/.*Result: \[\(.*\)\].*/\1/p' | tail -1 | tr ',' '\n' | tr -d ' ' | grep -E '^[0-9]+$' \
+              | sort -n | tail -1 | grep . || echo 0
+          }
+
           if [ "$ROLLOUT_PCT" -ge 100 ]; then
             STATUS=completed
             ROLLOUT_ARGS=()
@@ -113,27 +171,67 @@ jobs:
             ROLLOUT_ARGS=(rollout:"$FRACTION")
           fi
 
-          fastlane run upload_to_play_store \
-            package_name:${{ inputs.package_name }} \
-            json_key:play-service-account.json \
-            track:internal \
-            track_promote_to:production \
-            track_promote_release_status:"$STATUS" \
-            skip_upload_aab:true \
-            skip_upload_apk:true \
-            skip_upload_metadata:true \
-            skip_upload_images:true \
-            skip_upload_screenshots:true \
-            "${ROLLOUT_ARGS[@]}"
+          SUMMARY=""
+          PROMOTED_ANY=false
+          FAILED=false
+          for FLAVOR in $APP_FLAVORS; do
+            PACKAGE="$(var "$FLAVOR" APPLICATION_ID)"
+            LABEL="$PACKAGE"
+            [ "$FLAVOR" != "default" ] && LABEL="$FLAVOR ($PACKAGE)"
+            INTERNAL=$(newest_code "$PACKAGE" internal)
+            PRODUCTION=$(newest_code "$PACKAGE" production)
+            echo "$LABEL: internal $INTERNAL, production $PRODUCTION"
+
+            if [ "$INTERNAL" -eq 0 ]; then
+              SUMMARY+="- ⏭️ $LABEL: nothing on Internal Testing"$'\n'
+            elif [ "$INTERNAL" -le "$PRODUCTION" ]; then
+              SUMMARY+="- ⏭️ $LABEL: already in Production (version code $PRODUCTION)"$'\n'
+            elif fastlane run upload_to_play_store \
+                package_name:"$PACKAGE" \
+                json_key:play-service-account.json \
+                track:internal \
+                track_promote_to:production \
+                track_promote_release_status:"$STATUS" \
+                skip_upload_aab:true \
+                skip_upload_apk:true \
+                skip_upload_metadata:true \
+                skip_upload_images:true \
+                skip_upload_screenshots:true \
+                "${ROLLOUT_ARGS[@]}"; then
+              SUMMARY+="- ✅ $LABEL: version code $INTERNAL promoted to Production ($ROLLOUT_PCT% rollout)"$'\n'
+              PROMOTED_ANY=true
+            else
+              SUMMARY+="- ❌ $LABEL: promotion failed - check the workflow run"$'\n'
+              FAILED=true
+            fi
+          done
+
+          printf '%s' "$SUMMARY"
+          printf '%s' "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "summary<<SUMMARY_EOF"
+            printf '%s' "$SUMMARY"
+            echo "SUMMARY_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "PROMOTED_ANY=$PROMOTED_ANY" >> "$GITHUB_ENV"
+          echo "PROMOTE_FAILED=$FAILED" >> "$GITHUB_ENV"
 
       - name: Remove Play service account key
         if: always()
         run: rm -f play-service-account.json
 
+      # The release is live once any flavour reached Production.
       - name: Publish matching GitHub release
+        if: env.PROMOTED_ANY == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" --draft=false
+
+      - name: Fail if any flavour's promotion failed
+        if: env.PROMOTE_FAILED == 'true'
+        run: |
+          echo "::error::At least one flavour failed to promote - see the step summary."
+          exit 1
 
   # Only for the comment-triggered path - a workflow_dispatch run already shows its
   # result directly in the Actions UI, but a "promote-production" PR comment has no
@@ -149,10 +247,11 @@ jobs:
       - name: Comment promotion result on the PR
         env:
           GH_TOKEN: ${{ github.token }}
+          SUMMARY: ${{ needs.promote.outputs.summary }}
         run: |
           if [ "${{ needs.promote.result }}" = "success" ]; then
-            BODY="✅ Promoted to Production successfully (100% rollout)."
+            HEADER="## 🚀 Promote to Production"
           else
-            BODY="❌ Promotion to Production failed - check the workflow run."
+            HEADER="## ❌ Promote to Production failed - check the workflow run"
           fi
-          gh pr comment "${{ github.event.issue.number }}" --repo "${{ github.repository }}" --body "$BODY"
+          gh pr comment "${{ github.event.issue.number }}" --repo "${{ github.repository }}" --body "$(printf '%s\n\n%s' "$HEADER" "$SUMMARY")"

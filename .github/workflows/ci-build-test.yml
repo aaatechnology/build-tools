@@ -1,6 +1,6 @@
-# Reusable CI workflow shared across aaatechnology Android app repos: builds the
-# debug APK, runs unit tests + Jacoco coverage, and distributes the APK via Firebase
-# App Distribution. Each app repo's own workflow just calls this one with its
+# Reusable CI workflow shared across aaatechnology Android app repos: for each selected
+# product flavour, builds the debug APK, runs unit tests + Jacoco coverage, and distributes
+# the APK via Firebase App Distribution to that flavour's own Firebase app. Each app repo's own workflow just calls this one with its
 # app-specific inputs/secrets - see AgeCalculator's .github/workflows/android-apk-generation.yml
 # for the calling pattern.
 #
@@ -15,6 +15,12 @@
 # time this reusable workflow runs, it just needs to resolve the same PR head/base SHAs
 # a pull_request event gets for free, since issue_comment only carries the issue/PR
 # number, not its head/base refs directly.
+#
+# Flavours: `flavors` is "all" (every flavour the app has) or a comma/space-separated list.
+# Everything per flavour - applicationId, Firebase app ID, task names, output paths - comes
+# from the com.aaatech.build-tools plugin's printAppInfo task (>= 0.14.0), not from inputs,
+# so it can't drift from the app's Gradle setup. An app without flavours has exactly one,
+# named "default".
 
 name: Android Debug CI (reusable)
 
@@ -30,13 +36,13 @@ on:
         required: false
         type: string
         default: 'android-testers'
-      flavor:
-        description: 'Product flavor to build (e.g. "free"); empty for apps without flavors'
+      flavors:
+        description: 'Flavours to build: "all" (every flavour; "default" for an app without flavours) or a comma/space-separated list like "free,pro"'
         required: false
         type: string
-        default: ''
+        default: 'all'
       upload_to_firebase:
-        description: 'If false, skip uploading the debug APK to Firebase App Distribution'
+        description: 'If false, skip uploading the debug APKs to Firebase App Distribution'
         required: false
         type: boolean
         default: true
@@ -56,8 +62,10 @@ on:
         type: boolean
         default: false
     secrets:
+      # Only a fallback for an app with one flavour and no google-services.json: each
+      # flavour's Firebase app ID normally comes from google-services.json (printAppInfo).
       firebase_app_id:
-        required: true
+        required: false
       credential_file_content:
         required: true
       gh_packages_read_token:
@@ -81,8 +89,8 @@ jobs:
       # the pair together.
       GITHUB_ACTOR: aaatechnology
       GH_PACKAGES_READ_TOKEN: ${{ secrets.gh_packages_read_token }}
-      # AGP puts a flavored APK under apk/<flavor>/debug instead of apk/debug.
-      DEBUG_APK_DIR: ${{ inputs.flavor != '' && format('app/build/outputs/apk/{0}/debug', inputs.flavor) || 'app/build/outputs/apk/debug' }}
+      # Per-flavour results (APK path, version, coverage, Firebase status), one folder each.
+      FLAVOR_RESULTS: ${{ github.workspace }}/../flavor-results
 
     steps:
       # Unifies pull_request and issue_comment ("build-it" PR-comment retrigger)
@@ -95,12 +103,16 @@ jobs:
         id: pr_context
         env:
           GH_TOKEN: ${{ github.token }}
+          # The PR's branch name is chosen by whoever opens the PR, so it goes through an
+          # environment variable, never straight into the script (where a crafted name
+          # could run as shell code).
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "is_pr=true" >> "$GITHUB_OUTPUT"
             echo "head_sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
             echo "base_sha=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
-            echo "head_ref=${{ github.event.pull_request.head.ref }}" >> "$GITHUB_OUTPUT"
+            echo "head_ref=$PR_HEAD_REF" >> "$GITHUB_OUTPUT"
           elif [ "${{ github.event_name }}" = "issue_comment" ]; then
             PR_JSON=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}")
             echo "is_pr=true" >> "$GITHUB_OUTPUT"
@@ -136,29 +148,38 @@ jobs:
       - name: Change wrapper permissions
         run: chmod +x ./gradlew
 
-      # Run Tests Build + Jacoco coverage reports (no device needed) - the
-      # combined (all-modules) report, each module's own, and the module-name
-      # list the next step reads - and assemble the debug APK, combined into one
-      # invocation to avoid paying Gradle daemon startup/configuration twice. All
-      # three tasks come from com.aaatech.build-tools (>= 0.8.0) and are safe
-      # zero-config no-ops for any module lacking tests or enableUnitTestCoverage.
-      - name: Run gradle tests and build debug APK
+      # Asks Gradle for each selected flavour's applicationId, Firebase app ID, task names
+      # and output paths, as KEY=value lines (APP_FLAVORS, FREE_APPLICATION_ID, ...) added to
+      # the environment. Fails here, before building, on an unknown flavour. Gradle's JVM
+      # also prints WARNING lines, hence the filter.
+      - name: Read the app's flavours from Gradle
+        shell: bash
         env:
-          FLAVOR: ${{ inputs.flavor }}
-        # Capitalises the flavor: "free" -> assembleFreeDebug, "" -> assembleDebug.
-        # coverageVariant tells the coverage tasks which unit tests to run and read:
-        # "freeDebug" for a flavored app (it has no testDebugUnitTest), else "debug".
+          FLAVORS: ${{ inputs.flavors }}
         run: |
-          VARIANT_FLAVOR="$(printf '%s' "${FLAVOR:0:1}" | tr '[:lower:]' '[:upper:]')${FLAVOR:1}"
-          COVERAGE_VARIANT="${FLAVOR:+${FLAVOR}Debug}"
-          ./gradlew moduleJacocoReport combinedJacocoReport listCoverageModules "assemble${VARIANT_FLAVOR}Debug" \
-            "-PcoverageVariant=${COVERAGE_VARIANT:-debug}"
+          ./gradlew -q printAppInfo "-PappFlavors=$FLAVORS" > "$RUNNER_TEMP/app-info.txt"
+          grep -E '^[A-Z0-9_]+=' "$RUNNER_TEMP/app-info.txt" | tee -a "$GITHUB_ENV"
 
-      - name: Parse unit test coverage
+      # Per flavour: unit tests + Jacoco coverage reports (the combined all-modules report,
+      # each module's own, and the module list) and the debug APK, in one Gradle invocation
+      # (the daemon carries over between flavours). Coverage reports are read straight after
+      # each run, before the next flavour overwrites them. The coverage tasks come from
+      # com.aaatech.build-tools and are zero-config no-ops for modules without tests.
+      - name: Build, test and measure each flavour
+        id: build
+        shell: bash
         run: |
-          # Prints "covered total" (two numbers) from a JaCoCo XML report, or
-          # nothing at all if the report doesn't exist (module had no tests/
-          # coverage data - not an error, see com.aaatech.build-tools).
+          # A flavour's variable, e.g. var free DEBUG_APK_DIR -> $FREE_DEBUG_APK_DIR (the
+          # prefix rule matches printAppInfo's: freeProd -> FREE_PROD).
+          var() {
+            local key
+            key=$(printf '%s' "$1" | sed -E 's/([a-z0-9])([A-Z])/\1_\2/g; s/[^A-Za-z0-9]/_/g' | tr '[:lower:]' '[:upper:]')
+            local name="${key}_$2"
+            printf '%s' "${!name}"
+          }
+
+          # Prints "covered total" (two numbers) from a JaCoCo XML report, or nothing at all
+          # if the report doesn't exist (module had no tests/coverage data - not an error).
           parse_counts() {
             local report="$1"
             if [ -f "$report" ]; then
@@ -179,50 +200,55 @@ jobs:
             fi
           }
 
-          # Overall figure: the combined (all-modules) report, always registered
-          # on the app module by com.aaatech.build-tools.
-          read -r OVERALL_COVERED OVERALL_TOTAL <<< "$(parse_counts "app/build/reports/jacoco/combinedJacocoReport/combinedJacocoReport.xml")"
-          if [ -z "$OVERALL_TOTAL" ]; then
-            COVERAGE_SUMMARY="unavailable (report not found)"
-          else
-            COVERAGE_SUMMARY="$(format_pct "$OVERALL_COVERED" "$OVERALL_TOTAL")% lines covered (${OVERALL_COVERED}/${OVERALL_TOTAL})"
-          fi
+          for FLAVOR in $APP_FLAVORS; do
+            echo "::group::$FLAVOR"
+            OUT="$FLAVOR_RESULTS/$FLAVOR"
+            mkdir -p "$OUT"
 
-          # Per-module breakdown: every subproject Gradle itself reports (via
-          # listCoverageModules, the live project model - not a text-parsed
-          # guess at settings.gradle.kts's include(...) syntax, which varies
-          # across repos), skipped entirely when there's only one module
-          # (nothing to break down) - so a single-app-module repo's comment
-          # looks exactly like it did before this feature existed.
-          MODULES=$(cat app/build/coverage-modules.txt 2>/dev/null || true)
-          MODULE_COUNT=$(echo "$MODULES" | grep -c . || true)
+            ./gradlew moduleJacocoReport combinedJacocoReport listCoverageModules "$(var "$FLAVOR" DEBUG_ASSEMBLE_TASK)" \
+              "-PcoverageVariant=$(var "$FLAVOR" DEBUG_VARIANT)"
 
-          COVERAGE_BREAKDOWN=""
-          if [ "$MODULE_COUNT" -gt 1 ]; then
-            while IFS= read -r module; do
-              [ -z "$module" ] && continue
-              read -r MOD_COVERED MOD_TOTAL <<< "$(parse_counts "$module/build/reports/jacoco/moduleJacocoReport/moduleJacocoReport.xml")"
-              if [ -z "$MOD_TOTAL" ]; then
-                MOD_RESULT="no tests found"
-              else
-                MOD_RESULT="$(format_pct "$MOD_COVERED" "$MOD_TOTAL")% (${MOD_COVERED}/${MOD_TOTAL})"
-              fi
-              COVERAGE_BREAKDOWN="${COVERAGE_BREAKDOWN}  - ${module}: ${MOD_RESULT}
-          "
-            done <<< "$MODULES"
-          fi
+            # Overall figure: the combined (all-modules) report on the app module.
+            read -r OVERALL_COVERED OVERALL_TOTAL <<< "$(parse_counts "app/build/reports/jacoco/combinedJacocoReport/combinedJacocoReport.xml")"
+            if [ -z "$OVERALL_TOTAL" ]; then
+              echo "unavailable (report not found)" > "$OUT/coverage"
+            else
+              echo "$(format_pct "$OVERALL_COVERED" "$OVERALL_TOTAL")% lines covered (${OVERALL_COVERED}/${OVERALL_TOTAL})" > "$OUT/coverage"
+            fi
 
-          echo "COVERAGE_SUMMARY=${COVERAGE_SUMMARY}" >> $GITHUB_ENV
-          echo "COVERAGE_BREAKDOWN<<COVERAGE_BREAKDOWN_EOF" >> $GITHUB_ENV
-          echo "${COVERAGE_BREAKDOWN}" >> $GITHUB_ENV
-          echo "COVERAGE_BREAKDOWN_EOF" >> $GITHUB_ENV
+            # Per-module breakdown, only with more than one module (listCoverageModules is
+            # Gradle's live project model, not a guess at settings.gradle's syntax).
+            MODULES=$(cat app/build/coverage-modules.txt 2>/dev/null || true)
+            MODULE_COUNT=$(echo "$MODULES" | grep -c . || true)
+            : > "$OUT/coverage-breakdown"
+            if [ "$MODULE_COUNT" -gt 1 ]; then
+              while IFS= read -r module; do
+                [ -z "$module" ] && continue
+                read -r MOD_COVERED MOD_TOTAL <<< "$(parse_counts "$module/build/reports/jacoco/moduleJacocoReport/moduleJacocoReport.xml")"
+                if [ -z "$MOD_TOTAL" ]; then
+                  MOD_RESULT="no tests found"
+                else
+                  MOD_RESULT="$(format_pct "$MOD_COVERED" "$MOD_TOTAL")% (${MOD_COVERED}/${MOD_TOTAL})"
+                fi
+                echo "  - ${module}: ${MOD_RESULT}" >> "$OUT/coverage-breakdown"
+              done <<< "$MODULES"
+            fi
 
-      # Get the APK file name dynamically
-      - name: Get APK file name
-        run: |
-          APK_FILE=$(find "$DEBUG_APK_DIR" -name "*.apk" | head -1)
-          echo "APK_FILE=$APK_FILE" >> $GITHUB_ENV
-          echo "Found APK: $APK_FILE"
+            # The APK and the version AGP actually embedded in it (output-metadata.json is
+            # written alongside the APK), not recomputed here.
+            APK_DIR="$(var "$FLAVOR" DEBUG_APK_DIR)"
+            find "$APK_DIR" -name "*.apk" | head -1 > "$OUT/apk"
+            METADATA_FILE=$(find "$APK_DIR" -name "output-metadata.json" | head -1)
+            if [ -n "$METADATA_FILE" ]; then
+              jq -r '.elements[0].versionName' "$METADATA_FILE" > "$OUT/version_name"
+              jq -r '.elements[0].versionCode' "$METADATA_FILE" > "$OUT/version_code"
+            else
+              echo unknown > "$OUT/version_name"
+              echo unknown > "$OUT/version_code"
+            fi
+            echo "$FLAVOR: $(cat "$OUT/apk"), $(cat "$OUT/version_name") ($(cat "$OUT/version_code")), coverage $(cat "$OUT/coverage")"
+            echo "::endgroup::"
+          done
 
       # Resolve the actual head commit (github.sha is the synthetic merge commit on
       # pull_request events, not the real PR head) and its short hash + subject line.
@@ -261,105 +287,136 @@ jobs:
           echo "$COMMIT_MESSAGES" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
 
-      # Read the version actually embedded in the built APK, not recomputed here -
-      # output-metadata.json is written by AGP alongside the APK and reflects the
-      # actual build. For a debug build this is whatever the calling repo's Gradle
-      # setup derives from git directly (e.g. `git describe`), not a separate
-      # persisted "build number" - there's nothing else to extract here.
-      - name: Get version name
-        run: |
-          METADATA_FILE=$(find "$DEBUG_APK_DIR" -name "output-metadata.json" | head -1)
-          if [ -n "$METADATA_FILE" ]; then
-            VERSION_NAME=$(jq -r '.elements[0].versionName' "$METADATA_FILE")
-            VERSION_CODE=$(jq -r '.elements[0].versionCode' "$METADATA_FILE")
-          else
-            VERSION_NAME="unknown"
-            VERSION_CODE="unknown"
-          fi
-
-          echo "VERSION_NAME=$VERSION_NAME" >> $GITHUB_ENV
-          echo "VERSION_CODE=$VERSION_CODE" >> $GITHUB_ENV
-          echo "Extracted version: $VERSION_NAME, versionCode: $VERSION_CODE"
-
       # Get current timestamp for release notes (IST, not the runner's default UTC)
       - name: Get current timestamp
         run: |
           CURRENT_DATE=$(TZ='Asia/Kolkata' date +'%Y-%m-%d %H:%M:%S IST')
           echo "CURRENT_DATE=$CURRENT_DATE" >> $GITHUB_ENV
 
-      - name: Upload Artifact to Firebase App Distribution
+      # One upload per flavour, each to its own Firebase app (from google-services.json via
+      # printAppInfo). The firebase_app_id secret is only a fallback for an app with a single
+      # flavour and no google-services.json - with several flavours it would send every APK
+      # to the same app. Every flavour is tried; the step fails afterwards if any upload did.
+      - name: Upload debug APKs to Firebase App Distribution
         id: firebase_distribution
         if: inputs.upload_to_firebase
-        uses: wzieba/Firebase-Distribution-Github-Action@v1
-        with:
-          appId: ${{ secrets.firebase_app_id }}
-          serviceCredentialsFileContent: ${{ secrets.credential_file_content }}
-          groups: ${{ inputs.firebase_testers_group }}
-          file: ${{ env.APK_FILE }}
-          releaseNotes: |
-            🚀 ${{ inputs.app_display_name }} ${{ env.VERSION_NAME }} (Debug)
+        shell: bash
+        env:
+          CREDENTIALS: ${{ secrets.credential_file_content }}
+          FALLBACK_APP_ID: ${{ secrets.firebase_app_id }}
+          GROUP: ${{ inputs.firebase_testers_group }}
+          BRANCH: ${{ steps.pr_context.outputs.head_ref || github.ref_name }}
+          DISPLAY_NAME: ${{ inputs.app_display_name }}
+        run: |
+          var() {
+            local key
+            key=$(printf '%s' "$1" | sed -E 's/([a-z0-9])([A-Z])/\1_\2/g; s/[^A-Za-z0-9]/_/g' | tr '[:lower:]' '[:upper:]')
+            local name="${key}_$2"
+            printf '%s' "${!name}"
+          }
 
-            📱 **Recent Changes:**
-            ${{ env.COMMIT_MESSAGES }}
+          npm install -g firebase-tools >/dev/null 2>&1
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/firebase-sa.json"
+          printf '%s' "$CREDENTIALS" > "$GOOGLE_APPLICATION_CREDENTIALS"
 
-            📋 **Build Details:**
-            - Version: ${{ env.VERSION_NAME }}, Version Code: ${{ env.VERSION_CODE }}
-            - Branch: ${{ steps.pr_context.outputs.head_ref || github.ref_name }}
-            - Commit: ${{ env.COMMIT_SHA_SHORT }} - ${{ env.COMMIT_MESSAGE_SUBJECT }}
-            - Workflow run: ${{ github.run_number }}
-            - Date: ${{ env.CURRENT_DATE }}
-            - Unit test coverage: ${{ env.COVERAGE_SUMMARY }}
-            ${{ env.COVERAGE_BREAKDOWN }}
+          FLAVOR_COUNT=$(wc -w <<< "$APP_FLAVORS")
+          FAILED=false
+          for FLAVOR in $APP_FLAVORS; do
+            OUT="$FLAVOR_RESULTS/$FLAVOR"
+            APP_ID="$(var "$FLAVOR" FIREBASE_APP_ID)"
+            if [ -z "$APP_ID" ] && [ "$FLAVOR_COUNT" -eq 1 ]; then
+              APP_ID="$FALLBACK_APP_ID"
+            fi
+            if [ -z "$APP_ID" ]; then
+              echo "⚠️ not uploaded: no Firebase app for $(var "$FLAVOR" APPLICATION_ID) in google-services.json" > "$OUT/firebase"
+              FAILED=true
+              continue
+            fi
 
-      # Post APK and Firebase links as PR comment. context.issue.number resolves
-      # correctly for both pull_request and issue_comment events, so this needs no
-      # special-casing beyond the is_pr gate itself.
+            LABEL="$DISPLAY_NAME"
+            [ "$FLAVOR" != "default" ] && LABEL="$DISPLAY_NAME ($FLAVOR)"
+            cat > "$OUT/notes.txt" <<NOTES
+          🚀 $LABEL $(cat "$OUT/version_name") (Debug)
+
+          📱 Recent Changes:
+          $COMMIT_MESSAGES
+
+          📋 Build Details:
+          - Version: $(cat "$OUT/version_name"), Version Code: $(cat "$OUT/version_code")
+          - Branch: $BRANCH
+          - Commit: $COMMIT_SHA_SHORT - $COMMIT_MESSAGE_SUBJECT
+          - Workflow run: ${{ github.run_number }}
+          - Date: $CURRENT_DATE
+          - Unit test coverage: $(cat "$OUT/coverage")
+          $(cat "$OUT/coverage-breakdown")
+          NOTES
+
+            if firebase appdistribution:distribute "$(cat "$OUT/apk")" --app "$APP_ID" \
+                --groups "$GROUP" --release-notes-file "$OUT/notes.txt"; then
+              echo "✅ uploaded" > "$OUT/firebase"
+            else
+              echo "❌ upload failed - check the workflow run" > "$OUT/firebase"
+              FAILED=true
+            fi
+          done
+          rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
+          [ "$FAILED" = false ]
+
+      # One comment for the whole run, a section per flavour. Runs after a failed Firebase
+      # upload too (the builds succeeded), so the comment says which one failed.
       - name: Post links to PR
-        if: steps.pr_context.outputs.is_pr == 'true'
-        uses: actions/github-script@v8
-        with:
-          script: |
-            // Firebase App Distribution link (generic link to console)
-            const firebaseLink = ${{ inputs.upload_to_firebase }}
-              ? `🔥 **Firebase Distribution:** [Test on Firebase](https://appdistribution.firebase.google.com)`
-              : '';
+        if: always() && steps.pr_context.outputs.is_pr == 'true' && steps.build.outcome == 'success'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          BRANCH: ${{ steps.pr_context.outputs.head_ref || github.ref_name }}
+          DISPLAY_NAME: ${{ inputs.app_display_name }}
+          UPLOAD: ${{ inputs.upload_to_firebase }}
+        run: |
+          var() {
+            local key
+            key=$(printf '%s' "$1" | sed -E 's/([a-z0-9])([A-Z])/\1_\2/g; s/[^A-Za-z0-9]/_/g' | tr '[:lower:]' '[:upper:]')
+            local name="${key}_$2"
+            printf '%s' "${!name}"
+          }
 
-            // Build details
-            const buildInfo = `
-            📋 **Build Information:**
-            - **Version:** ${{ env.VERSION_NAME }}, Version Code: ${{ env.VERSION_CODE }}
-            - **Branch:** ${{ steps.pr_context.outputs.head_ref || github.ref_name }}
-            - **Commit:** \`${{ env.COMMIT_SHA_SHORT }}\` - ${{ env.COMMIT_MESSAGE_SUBJECT }}
-            - **Workflow run:** #${{ github.run_number }}
-            - **Date:** ${{ env.CURRENT_DATE }}
-            - **Unit test coverage:** ${{ env.COVERAGE_SUMMARY }}
-            ${{ env.COVERAGE_BREAKDOWN }}
-            `;
-
-            // Recent changes
-            const changes = `
-            📝 **Recent Changes:**
-            ${{ env.COMMIT_MESSAGES }}
-            `;
-
-            // Combine all information
-            const comment = `## 🚀 ${{ inputs.app_display_name }} Debug Build Ready
-
-            ${firebaseLink}
-
-            ${buildInfo}
-
-            ${changes}
-
-            ---
-            *This build was automatically generated by GitHub Actions*`;
-
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: comment
-            });
+          BODY="$RUNNER_TEMP/pr-comment.md"
+          {
+            echo "## 🚀 $DISPLAY_NAME Debug Build Ready"
+            echo
+            if [ "$UPLOAD" = "true" ]; then
+              echo "🔥 **Firebase Distribution:** [Test on Firebase](https://appdistribution.firebase.google.com)"
+              echo
+            fi
+            for FLAVOR in $APP_FLAVORS; do
+              OUT="$FLAVOR_RESULTS/$FLAVOR"
+              if [ "$FLAVOR" = "default" ]; then
+                echo "### 📱 $(var "$FLAVOR" APPLICATION_ID)"
+              else
+                echo "### 📱 $FLAVOR · $(var "$FLAVOR" APPLICATION_ID)"
+              fi
+              echo "- **Version:** $(cat "$OUT/version_name"), Version Code: $(cat "$OUT/version_code")"
+              echo "- **Unit test coverage:** $(cat "$OUT/coverage")"
+              cat "$OUT/coverage-breakdown"
+              if [ "$UPLOAD" = "true" ]; then
+                echo "- **Firebase:** $(cat "$OUT/firebase" 2>/dev/null || echo '❌ not uploaded - check the workflow run')"
+              fi
+              echo
+            done
+            echo "📋 **Build Information:**"
+            echo "- **Branch:** $BRANCH"
+            echo "- **Commit:** \`$COMMIT_SHA_SHORT\` - $COMMIT_MESSAGE_SUBJECT"
+            echo "- **Workflow run:** #${{ github.run_number }}"
+            echo "- **Date:** $CURRENT_DATE"
+            echo
+            echo "📝 **Recent Changes:**"
+            echo "$COMMIT_MESSAGES"
+            echo
+            echo "---"
+            echo "*This build was automatically generated by GitHub Actions*"
+          } > "$BODY"
+          gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body-file "$BODY"
 
       # Queues the merge - it does not bypass develop's branch protection. GitHub
       # only actually merges once every required check has passed AND every

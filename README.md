@@ -9,10 +9,56 @@ means neither can silently drift out of sync per-repo again.
 
 ## Workflows
 
+### Product flavours (all three workflows, from 0.14.0)
+
+Every workflow takes `flavors`: `all` (the default: every flavour the app has) or a
+comma/space-separated list such as `free,pro`. Nothing else about a flavour is passed
+in: the workflows ask Gradle, through this plugin's `printAppInfo` task, for each
+selected flavour's applicationId, Firebase app ID (looked up in `google-services.json`
+by package name), task names and output paths:
+
+```
+./gradlew -q printAppInfo -PappFlavors=all
+APP_FLAVORS=free pro
+FREE_APPLICATION_ID=com.example.app
+FREE_FIREBASE_APP_ID=1:123:android:abc
+FREE_DEBUG_ASSEMBLE_TASK=assembleFreeDebug
+...
+PRO_APPLICATION_ID=com.example.app.pro
+...
+```
+
+An app **without** product flavours has exactly one flavour, named `default`
+(`DEFAULT_APPLICATION_ID`, `DEFAULT_DEBUG_ASSEMBLE_TASK=assembleDebug`, ...), so such an
+app needs no flavour configuration at all. The task fails before anything is built when
+a requested flavour doesn't exist, a real flavour is named `default`, or
+`google-services.json` exists but has no client for a selected flavour's package (its
+Firebase upload would otherwise go to another app). Run it locally to see exactly what
+CI will use.
+
+To choose flavours when running a workflow by hand, give the caller's
+`workflow_dispatch` a `choice` input and pass it on (pull requests and pushes keep the
+default `all`):
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      flavors:
+        description: 'Flavours'
+        type: choice
+        options: [ all, free, pro ]
+        default: all
+...
+    with:
+      flavors: ${{ inputs.flavors || 'all' }}
+```
+
 ### `ci-build-test.yml` (reusable)
 
-Builds the debug APK, runs unit tests + Jacoco coverage, and distributes the APK via
-Firebase App Distribution. Call it from an app repo's own workflow like:
+For each selected flavour, builds the debug APK, runs unit tests + Jacoco coverage,
+and distributes the APK via Firebase App Distribution to that flavour's own Firebase
+app; one PR comment covers every flavour. Call it from an app repo's own workflow like:
 
 ```yaml
 name: CI - Build, Test & Debug APK
@@ -61,7 +107,9 @@ jobs:
     secrets: inherit
 ```
 
-Required secrets on the calling repo: `FIREBASE_APP_ID`, `CREDENTIAL_FILE_CONTENT`.
+Required secrets on the calling repo: `CREDENTIAL_FILE_CONTENT`,
+`GH_PACKAGES_READ_TOKEN`. `FIREBASE_APP_ID` is now only a fallback for an app with a
+single flavour and no `google-services.json`.
 
 `auto_merge_to_develop` (optional, default `false`) queues GitHub's native auto-merge
 on any PR targeting `develop` once this job succeeds. It does **not** bypass review -
@@ -86,8 +134,9 @@ only behavior.
 
 ### `cd-internal-testing.yml` (reusable)
 
-Builds a signed release App Bundle + APK, uploads the AAB to Play Store Internal
-Testing, uploads the release APK to Firebase App Distribution, and - only once that
+For each selected flavour, builds a signed release App Bundle + APK, uploads the AAB
+to that flavour's own package on Play Store Internal Testing, uploads the release APK
+to its Firebase app, and - only once every flavour's
 upload is confirmed successful - creates the git tag + draft GitHub release that
 records the shipped version. Call it on push to `main`:
 
@@ -115,22 +164,23 @@ jobs:
     uses: aaatechnology/build-tools/.github/workflows/cd-internal-testing.yml@main
     with:
       app_display_name: Age Calculator
-      package_name: com.arun.agecalculator
       play_internal_testing_link: ${{ vars.PLAY_INTERNAL_TESTING_LINK }}
     secrets: inherit
 ```
 
 Required secrets on the calling repo: `ANDROID_KEYSTORE_BASE64`,
 `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`,
-`PLAY_SERVICE_ACCOUNT_JSON`, `FIREBASE_APP_ID`, `CREDENTIAL_FILE_CONTENT`.
+`PLAY_SERVICE_ACCOUNT_JSON`, `CREDENTIAL_FILE_CONTENT`, `GH_PACKAGES_READ_TOKEN`
+(`FIREBASE_APP_ID` only as the single-flavour fallback).
 `play_internal_testing_link` is optional (an org/repo variable, not a secret) -
 omit the `with:` line entirely if you don't have one, rather than passing an empty
 string.
 
-An app with product flavors passes `flavor:` (e.g. `free`) to both this workflow and
-`ci-build-test.yml`: only that flavor is tested (`test<Flavor>DebugUnitTest`), built
-(`bundle<Flavor>Release`/`assemble<Flavor>Release`) and uploaded, from its
-`<flavor>Release` output paths. Leave it out for apps without flavors.
+All selected flavours ship as one version (one tag, one draft GitHub release with each
+flavour's AAB and mapping file). The tag and release are only created once **every**
+flavour has reached Internal Testing; if one fails, re-run the workflow: flavours whose
+versionCode is already on Internal Testing are skipped (Play rejects a duplicate), and
+the rest are uploaded. The PR comment lists the Play and Firebase result per flavour.
 
 **Versioning is git-native, not file-based.** The calling app's `app/build.gradle.kts`
 must derive `versionCode`/`versionName` from git (see AgeCalculator's for the
@@ -158,7 +208,10 @@ checkout can't see the tags or full commit history this depends on.
 
 Manually promotes the build already sitting on Play Store's Internal Testing track
 straight to Production - no rebuild, no re-upload, just a track move via the Play
-Developer API. Deliberately `workflow_dispatch`-only in every caller: a production
+Developer API. Per selected flavour, it compares the newest versionCode on Internal
+Testing with Production's and promotes only when Internal is newer; a flavour already
+in Production is reported and left alone. The GitHub release is published once any
+flavour was promoted. Deliberately `workflow_dispatch`-only in every caller: a production
 rollout is irreversible-ish and user-facing, so it should always need an explicit
 human trigger, never an automatic one.
 
@@ -178,6 +231,11 @@ on:
         description: 'Percent of users to roll out to (1-100). Less than 100 starts a staged rollout.'
         required: true
         default: '100'
+      flavors:
+        description: 'Flavours to promote'
+        type: choice
+        options: [ all ]   # e.g. [ all, free, pro ] for an app with flavours
+        default: all
 
 # No cancel-in-progress: a production rollout should never be killed mid-flight.
 # This just queues a second trigger instead of letting two promotions race against
@@ -194,12 +252,13 @@ jobs:
       pull-requests: write
     uses: aaatechnology/build-tools/.github/workflows/cd-production-promote.yml@main
     with:
-      package_name: com.arun.agecalculator
+      flavors: ${{ inputs.flavors || 'all' }}
       rollout_percentage: ${{ inputs.rollout_percentage }}
     secrets: inherit
 ```
 
-Required secret on the calling repo: `PLAY_SERVICE_ACCOUNT_JSON`.
+Required secrets on the calling repo: `PLAY_SERVICE_ACCOUNT_JSON`,
+`GH_PACKAGES_READ_TOKEN` (it runs Gradle to read the flavours' packages).
 
 ### A note on `secrets: inherit`
 
@@ -229,6 +288,9 @@ the reference consumer.
   `git describe --tags`), overridable for release builds via
   `-PreleaseVersionCode`/`-PreleaseVersionName` project properties - the same
   mechanism `cd-internal-testing.yml`/`cd-production-promote.yml` already rely on.
+- A `printAppInfo` task that prints each product flavour's applicationId, Firebase
+  app ID, task names and output paths for the CI/CD workflows (see "Product
+  flavours" above).
 - Jacoco setup (`jacoco` plugin + `jacocoTestReportUnitOnly` task), reading Kotlin
   classes from AGP's built-in Kotlin compiler output path.
 - A `combinedJacocoReport` task (output under
@@ -237,7 +299,7 @@ the reference consumer.
   run into one report, instead of reading each module's number one at a
   time. The variant defaults to `debug`; an app with product flavors passes
   `-PcoverageVariant=<flavor>Debug` (e.g. `freeDebug`), which `ci-build-test.yml`
-  does from its `flavor` input, so the right `test<Variant>UnitTest` runs and its
+  does for each selected flavour, so the right `test<Variant>UnitTest` runs and its
   Kotlin/Java classes and `.exec` data are read. No per-module opt-in beyond that: a module that isn't Android/Kotlin, has
   no tests, or lacks `android.buildTypes.debug { enableUnitTestCoverage = true }`
   (the same flag this plugin's own per-module Jacoco setup relies on) just
