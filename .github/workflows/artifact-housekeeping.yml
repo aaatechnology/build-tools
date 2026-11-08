@@ -8,7 +8,7 @@
 #
 # Requires a secret named ARTIFACT_CLEANUP_TOKEN on this repo: a personal access
 # token (classic, `repo` scope; or fine-grained with "Actions: read and write" on the
-# target repos) belonging to an account with access to every repo in REPOS below.
+# target repos) belonging to an account with access to every repo in the aaatechnology account.
 # The default GITHUB_TOKEN only has access to this repo, not the others.
 
 name: Artifact Housekeeping
@@ -24,14 +24,11 @@ on:
         required: true
         default: '3'
 
+# Every repo in the aaatechnology account is cleaned (listed on each run), so a new app repo
+# is covered without editing this file. It used to be a fixed list that missed new repos
+# (FileManager, water-tracker).
 env:
-  REPOS: >-
-    AgeCalculator
-    IFSC
-    Astrology
-    financial-calculator
-    Vault
-    Flashlight
+  OWNER: aaatechnology
 
 jobs:
   cleanup:
@@ -46,19 +43,22 @@ jobs:
           CUTOFF_EPOCH=$(( $(date -u +%s) - MAX_AGE_DAYS * 86400 ))
           TOTAL_DELETED=0
           TOTAL_BYTES=0
+          REPOS=$(gh repo list "$OWNER" --limit 500 --no-archived --json name -q '.[].name' | sort)
+          echo "Repos: $(echo "$REPOS" | wc -l | tr -d ' ')"
 
           for repo in $REPOS; do
             echo "== $repo =="
             REPO_DELETED=0
             REPO_BYTES=0
 
-            gh api "repos/aaatechnology/$repo/actions/artifacts" --paginate \
+            # Log lines go to stderr: stdout is the list of deleted sizes counted below.
+            gh api "repos/$OWNER/$repo/actions/artifacts" --paginate \
                 -q '.artifacts[] | [.id, .size_in_bytes, .created_at] | @tsv' \
               | while IFS=$'\t' read -r id size created_at; do
                   created_epoch=$(date -u -d "$created_at" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$created_at" +%s)
                   if [ "$created_epoch" -lt "$CUTOFF_EPOCH" ]; then
-                    echo "  deleting artifact $id (created $created_at, ${size} bytes)"
-                    gh api -X DELETE "repos/aaatechnology/$repo/actions/artifacts/$id"
+                    echo "  deleting artifact $id (created $created_at, ${size} bytes)" >&2
+                    gh api -X DELETE "repos/$OWNER/$repo/actions/artifacts/$id" >&2
                     echo "$size"
                   fi
                 done > /tmp/deleted_sizes.txt || true
@@ -75,4 +75,4 @@ jobs:
           done
 
           echo "## Artifact Housekeeping Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "Deleted $TOTAL_DELETED artifact(s) totaling $TOTAL_BYTES bytes across: $REPOS" >> "$GITHUB_STEP_SUMMARY"
+          echo "Deleted $TOTAL_DELETED artifact(s) totaling $TOTAL_BYTES bytes across: ${REPOS//$'\n'/ }" >> "$GITHUB_STEP_SUMMARY"

@@ -4,6 +4,12 @@
 # app-specific inputs/secrets - see AgeCalculator's .github/workflows/android-apk-generation.yml
 # for the calling pattern.
 #
+# On a PR it keeps one comment up to date (found by a hidden marker): each flavour's
+# version, coverage and Firebase upload, or, when the run fails, the failing flavour, its
+# failing unit tests and Gradle's error, with links to the run and its test and coverage
+# reports artifact (failures only, kept 3 days). A failure before the build (Gradle not
+# starting) is reported too.
+#
 # Extracted after the same storage-quota bug (a GitHub Actions artifact upload with no
 # consumer, blocking every PR check) was found independently copy-pasted across six
 # app repos - fixing it once here means it can't drift out of sync per-repo again.
@@ -91,6 +97,8 @@ jobs:
       GH_PACKAGES_READ_TOKEN: ${{ secrets.gh_packages_read_token }}
       # Per-flavour results (APK path, version, coverage, Firebase status), one folder each.
       FLAVOR_RESULTS: ${{ github.workspace }}/../flavor-results
+      # Each flavour's unit-test and Jacoco reports, uploaded as the run's reports artifact.
+      REPORTS: ${{ github.workspace }}/../reports
 
     steps:
       # Unifies pull_request and issue_comment ("build-it" PR-comment retrigger)
@@ -157,7 +165,10 @@ jobs:
         env:
           FLAVORS: ${{ inputs.flavors }}
         run: |
-          ./gradlew -q printAppInfo "-PappFlavors=$FLAVORS" > "$RUNNER_TEMP/app-info.txt"
+          # stderr is kept too: if this fails (Gradle can't even start, e.g. its download times
+          # out), the PR comment shows why.
+          ./gradlew -q printAppInfo "-PappFlavors=$FLAVORS" > "$RUNNER_TEMP/app-info.txt" \
+            2> >(tee "$RUNNER_TEMP/app-info.err" >&2)
           grep -E '^[A-Z0-9_]+=' "$RUNNER_TEMP/app-info.txt" | tee -a "$GITHUB_ENV"
 
       # Per flavour: unit tests + Jacoco coverage reports (the combined all-modules report,
@@ -165,6 +176,9 @@ jobs:
       # (the daemon carries over between flavours). Coverage reports are read straight after
       # each run, before the next flavour overwrites them. The coverage tasks come from
       # com.aaatech.build-tools and are zero-config no-ops for modules without tests.
+      # A failing flavour doesn't stop the others: its status, failing tests and Gradle's
+      # "What went wrong" are kept for the PR comment, every flavour's test and coverage
+      # reports are copied to $REPORTS (uploaded below), and the step fails at the end.
       - name: Build, test and measure each flavour
         id: build
         shell: bash
@@ -200,13 +214,59 @@ jobs:
             fi
           }
 
+          # Copies every module's unit-test and Jacoco reports for this flavour into $REPORTS.
+          keep_reports() {
+            local dest="$REPORTS/$1"
+            mkdir -p "$dest"
+            find . -path ./.git -prune -o -type d \( -path '*/build/reports/tests' -o -path '*/build/test-results' \
+              -o -path '*/build/reports/jacoco' \) -print 2>/dev/null | while IFS= read -r dir; do
+              mkdir -p "$dest/${dir#./}"
+              cp -R "$dir/." "$dest/${dir#./}/"
+            done
+          }
+
+          # Lists the failed unit tests from the JUnit XML results, at most 20, one per line.
+          failed_tests() {
+            python3 - <<'PY'
+          import glob, xml.etree.ElementTree as ET
+          out = []
+          for f in sorted(glob.glob("**/build/test-results/**/*.xml", recursive=True)):
+              try:
+                  root = ET.parse(f).getroot()
+              except ET.ParseError:
+                  continue
+              for case in root.iter("testcase"):
+                  bad = case.find("failure")
+                  if bad is None:
+                      bad = case.find("error")
+                  if bad is not None:
+                      cls = case.get("classname", "").rsplit(".", 1)[-1]
+                      msg = (bad.get("message") or bad.text or "").strip().splitlines()
+                      msg = msg[0][:200] if msg else ""
+                      out.append(f"- `{cls} > {case.get('name')}`" + (f": {msg}" if msg else ""))
+          print("\n".join(out[:20]) + (f"\n- …and {len(out) - 20} more" if len(out) > 20 else ""))
+          PY
+          }
+
+          ANY_FAILED=false
           for FLAVOR in $APP_FLAVORS; do
             echo "::group::$FLAVOR"
             OUT="$FLAVOR_RESULTS/$FLAVOR"
             mkdir -p "$OUT"
 
-            ./gradlew moduleJacocoReport combinedJacocoReport listCoverageModules "$(var "$FLAVOR" DEBUG_ASSEMBLE_TASK)" \
-              "-PcoverageVariant=$(var "$FLAVOR" DEBUG_VARIANT)"
+            if ./gradlew moduleJacocoReport combinedJacocoReport listCoverageModules "$(var "$FLAVOR" DEBUG_ASSEMBLE_TASK)" \
+              "-PcoverageVariant=$(var "$FLAVOR" DEBUG_VARIANT)" 2>&1 | tee "$OUT/gradle.log"; then
+              echo success > "$OUT/status"
+            else
+              echo failure > "$OUT/status"
+              ANY_FAILED=true
+              failed_tests > "$OUT/failed-tests"
+              sed -n '/^\* What went wrong:/,/^\* Try:/p' "$OUT/gradle.log" | grep -v '^\* Try:' | head -15 > "$OUT/error"
+              keep_reports "$FLAVOR"
+              echo "::endgroup::"
+              continue
+            fi
+            keep_reports "$FLAVOR"
 
             # Overall figure: the combined (all-modules) report on the app module.
             read -r OVERALL_COVERED OVERALL_TOTAL <<< "$(parse_counts "app/build/reports/jacoco/combinedJacocoReport/combinedJacocoReport.xml")"
@@ -249,10 +309,27 @@ jobs:
             echo "$FLAVOR: $(cat "$OUT/apk"), $(cat "$OUT/version_name") ($(cat "$OUT/version_code")), coverage $(cat "$OUT/coverage")"
             echo "::endgroup::"
           done
+          [ "$ANY_FAILED" = false ]
+
+      # When the build fails: each flavour's test and coverage reports, so a failing test can
+      # be read in its HTML report; the PR comment links to it. Failures only, reports only (no
+      # APKs) and kept 3 days - artifacts count toward the account's storage quota, which an
+      # upload nobody read once filled (see top). build-tools' Artifact Housekeeping also
+      # deletes anything older than 3 days in every repo.
+      - name: Upload test and coverage reports
+        id: reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-attempt-${{ github.run_attempt }}
+          path: ${{ env.REPORTS }}
+          retention-days: 3
+          if-no-files-found: ignore
 
       # Resolve the actual head commit (github.sha is the synthetic merge commit on
       # pull_request events, not the real PR head) and its short hash + subject line.
       - name: Get commit message
+        if: always()
         run: |
           if [ "${{ steps.pr_context.outputs.is_pr }}" = "true" ]; then
             COMMIT_SHA="${{ steps.pr_context.outputs.head_sha }}"
@@ -272,6 +349,7 @@ jobs:
       # (base..head) - not the target branch's whole history. For a direct push
       # (e.g. after a merge), fall back to the last 10 non-merge commits from HEAD.
       - name: Generate release notes from commits
+        if: always()
         run: |
           if [ "${{ steps.pr_context.outputs.is_pr }}" = "true" ]; then
             COMMIT_MESSAGES=$(git log ${{ steps.pr_context.outputs.base_sha }}..${{ env.COMMIT_SHA }} --no-merges --pretty=format:"• %s" 2>/dev/null || echo "")
@@ -289,6 +367,7 @@ jobs:
 
       # Get current timestamp for release notes (IST, not the runner's default UTC)
       - name: Get current timestamp
+        if: always()
         run: |
           CURRENT_DATE=$(TZ='Asia/Kolkata' date +'%Y-%m-%d %H:%M:%S IST')
           echo "CURRENT_DATE=$CURRENT_DATE" >> $GITHUB_ENV
@@ -362,10 +441,13 @@ jobs:
           rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
           [ "$FAILED" = false ]
 
-      # One comment for the whole run, a section per flavour. Runs after a failed Firebase
-      # upload too (the builds succeeded), so the comment says which one failed.
+      # One comment per PR, updated by every run (found by its hidden marker): a section per
+      # flavour with its version, coverage and Firebase upload, or, when the run failed, what
+      # failed - the flavour, its failing unit tests and Gradle's error - with links to the
+      # run and its test and coverage reports. Also posts when the build never started (e.g.
+      # Gradle couldn't be downloaded), with the error from reading the flavours.
       - name: Post links to PR
-        if: always() && steps.pr_context.outputs.is_pr == 'true' && steps.build.outcome == 'success'
+        if: always() && steps.pr_context.outputs.is_pr == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -373,6 +455,9 @@ jobs:
           BRANCH: ${{ steps.pr_context.outputs.head_ref || github.ref_name }}
           DISPLAY_NAME: ${{ inputs.app_display_name }}
           UPLOAD: ${{ inputs.upload_to_firebase }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+          REPORTS_URL: ${{ steps.reports.outputs.artifact-url }}
         run: |
           var() {
             local key
@@ -381,42 +466,93 @@ jobs:
             printf '%s' "${!name}"
           }
 
+          MARKER="<!-- aaatech-ci-build -->"
+          REPORTS_LINE=""
+          [ -n "$REPORTS_URL" ] && REPORTS_LINE=" · [Test and coverage reports]($REPORTS_URL)"
+
           BODY="$RUNNER_TEMP/pr-comment.md"
           {
-            echo "## 🚀 $DISPLAY_NAME Debug Build Ready"
+            echo "$MARKER"
+            if [ "$BUILD_OUTCOME" = "success" ]; then
+              echo "## 🚀 $DISPLAY_NAME Debug Build Ready"
+            else
+              echo "## ❌ $DISPLAY_NAME CI failed"
+            fi
             echo
-            if [ "$UPLOAD" = "true" ]; then
+            echo "🔗 [Workflow run #${{ github.run_number }}]($RUN_URL)$REPORTS_LINE"
+            echo
+            if [ "$BUILD_OUTCOME" = "success" ] && [ "$UPLOAD" = "true" ]; then
               echo "🔥 **Firebase Distribution:** [Test on Firebase](https://appdistribution.firebase.google.com)"
               echo
             fi
+
+            if [ -z "$APP_FLAVORS" ]; then
+              # Nothing was built: the run failed before the build (reading the flavours).
+              echo "**The build didn't start.** Reading the app's flavours from Gradle failed:"
+              echo
+              echo '```'
+              grep -vE '^\s*at |^\s*\.\.\. [0-9]+ more' "$RUNNER_TEMP/app-info.err" 2>/dev/null | grep . | tail -8 \
+                || echo "(no error output - see the workflow run)"
+              echo '```'
+              echo
+            fi
+
             for FLAVOR in $APP_FLAVORS; do
               OUT="$FLAVOR_RESULTS/$FLAVOR"
+              STATUS=$(cat "$OUT/status" 2>/dev/null || echo "not built")
+              ICON="📱"
+              [ "$STATUS" != "success" ] && ICON="❌"
               if [ "$FLAVOR" = "default" ]; then
-                echo "### 📱 $(var "$FLAVOR" APPLICATION_ID)"
+                echo "### $ICON $(var "$FLAVOR" APPLICATION_ID)"
               else
-                echo "### 📱 $FLAVOR · $(var "$FLAVOR" APPLICATION_ID)"
+                echo "### $ICON $FLAVOR · $(var "$FLAVOR" APPLICATION_ID)"
               fi
-              echo "- **Version:** $(cat "$OUT/version_name"), Version Code: $(cat "$OUT/version_code")"
-              echo "- **Unit test coverage:** $(cat "$OUT/coverage")"
-              cat "$OUT/coverage-breakdown"
-              if [ "$UPLOAD" = "true" ]; then
-                echo "- **Firebase:** $(cat "$OUT/firebase" 2>/dev/null || echo '❌ not uploaded - check the workflow run')"
+              if [ "$STATUS" = "success" ]; then
+                echo "- **Version:** $(cat "$OUT/version_name"), Version Code: $(cat "$OUT/version_code")"
+                echo "- **Unit test coverage:** $(cat "$OUT/coverage")"
+                cat "$OUT/coverage-breakdown"
+                if [ "$UPLOAD" = "true" ]; then
+                  echo "- **Firebase:** $(cat "$OUT/firebase" 2>/dev/null || echo '❌ not uploaded - check the workflow run')"
+                fi
+              elif [ "$STATUS" = "failure" ]; then
+                if [ -s "$OUT/failed-tests" ] && grep -q . "$OUT/failed-tests"; then
+                  echo "**Failing unit tests:**"
+                  cat "$OUT/failed-tests"
+                  echo
+                fi
+                if [ -s "$OUT/error" ]; then
+                  echo "**Gradle:**"
+                  echo '```'
+                  cat "$OUT/error"
+                  echo '```'
+                fi
+              else
+                echo "- Not built (the run stopped before this flavour)"
               fi
               echo
             done
+
             echo "📋 **Build Information:**"
             echo "- **Branch:** $BRANCH"
             echo "- **Commit:** \`$COMMIT_SHA_SHORT\` - $COMMIT_MESSAGE_SUBJECT"
-            echo "- **Workflow run:** #${{ github.run_number }}"
+            echo "- **Workflow run:** [#${{ github.run_number }}]($RUN_URL)"
             echo "- **Date:** $CURRENT_DATE"
             echo
             echo "📝 **Recent Changes:**"
             echo "$COMMIT_MESSAGES"
             echo
             echo "---"
-            echo "*This build was automatically generated by GitHub Actions*"
+            echo "*Updated by GitHub Actions on every run*"
           } > "$BODY"
-          gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body-file "$BODY"
+
+          # Update this PR's CI comment if there is one, otherwise post it.
+          COMMENT_ID=$(gh api --paginate "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
+            --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" | tail -1)
+          if [ -n "$COMMENT_ID" ]; then
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/$COMMENT_ID" -F "body=@$BODY" > /dev/null
+          else
+            gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body-file "$BODY"
+          fi
 
       # Queues the merge - it does not bypass develop's branch protection. GitHub
       # only actually merges once every required check has passed AND every

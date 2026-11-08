@@ -58,7 +58,12 @@ on:
 
 For each selected flavour, builds the debug APK, runs unit tests + Jacoco coverage,
 and distributes the APK via Firebase App Distribution to that flavour's own Firebase
-app; one PR comment covers every flavour. Call it from an app repo's own workflow like:
+app; one PR comment covers every flavour and is updated on every run. When the run fails
+(from 0.14.1), the comment says which flavour failed, lists its failing unit tests and
+Gradle's error, and links to the run and its test and coverage reports (an artifact, only on
+failure, kept 3 days); a failure before the build starts (e.g. the Gradle download) is
+reported too.
+Call it from an app repo's own workflow like:
 
 ```yaml
 name: CI - Build, Test & Debug APK
