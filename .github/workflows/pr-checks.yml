@@ -1,0 +1,148 @@
+# Checks every PR into main and keeps one comment on it up to date (found by a hidden
+# marker) with each check's result and a link to the run:
+#
+#   PR description  the template's sections are filled in, with a valid Version Bump
+#   Version bump    the bump fits what changed, and the version merging would release
+#   actionlint      every workflow; errors fail, shellcheck style/info/warning notes are listed
+#   Plugin build    ./gradlew build of the com.aaatech.build-tools plugin
+#
+# Errors fail the check; warnings are only listed. Runs again when the description is
+# edited, so fixing the template doesn't need a new push. The release itself happens on
+# merge, in publish-plugin.yml.
+
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [ main ]
+    types: [ opened, synchronize, reopened, edited ]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    env:
+      RESULTS: ${{ github.workspace }}/../pr-check-results
+      # Written by whoever opens the PR, so it's only ever read from the environment.
+      PR_BODY: ${{ github.event.pull_request.body }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          # Tags and the base commit, for the changed files and the next version.
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: '21'
+          cache: 'gradle'
+
+      - name: Check the PR description
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p "$RESULTS"
+          python3 .github/scripts/pr_body.py check > "$RESULTS/template.json"
+          cat "$RESULTS/template.json"
+
+      # What app repos use is the plugin and the reusable workflows; this repo's own CI
+      # (pr-checks.yml, publish-plugin.yml, .github/scripts) and the docs don't reach them.
+      - name: Check the version bump
+        if: ${{ !cancelled() }}
+        run: |
+          BUMP=$(python3 .github/scripts/pr_body.py bump)
+          LATEST=$(git tag --list | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          CHANGED=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          RELEASED=$(printf '%s\n' "$CHANGED" | grep -E '^(build\.gradle\.kts|settings\.gradle\.kts|gradle/|src/|\.github/workflows/)' \
+            | grep -vE '^\.github/workflows/(pr-checks|publish-plugin)\.yml$' || true)
+
+          WARNINGS=()
+          NOTE=""
+          if [ -n "$BUMP" ]; then
+            NEXT=$(BUMP="$BUMP" python3 .github/scripts/pr_body.py next "${LATEST:-0.0.0}")
+            if [ -n "$NEXT" ]; then
+              NOTE="merging releases \`$NEXT\` (\`$BUMP\` after \`${LATEST:-none}\`)"
+            else
+              NOTE="merging releases nothing (\`none\`)"
+            fi
+            if [ "$BUMP" = none ] && [ -n "$RELEASED" ]; then
+              WARNINGS+=("Version Bump is \`none\`, but files app repos use changed ($(printf '%s' "$RELEASED" | tr '\n' ' ')): they won't get a release.")
+            fi
+            if [ "$BUMP" != none ] && [ -z "$RELEASED" ]; then
+              WARNINGS+=("Nothing app repos use changed; \`none\` would skip an empty release.")
+            fi
+          fi
+          if git diff "$BASE_SHA...$HEAD_SHA" -- build.gradle.kts | grep -qE '^[+-]version = '; then
+            WARNINGS+=("\`version\` in build.gradle.kts was edited: the release workflow sets it on merge, from the latest tag and the Version Bump.")
+          fi
+
+          jq -n --arg note "$NOTE" '{errors: [], warnings: $ARGS.positional, note: $note}' \
+            --args "${WARNINGS[@]}" > "$RESULTS/version.json"
+          cat "$RESULTS/version.json"
+
+      # Errors are actionlint's own findings (syntax, expressions, unknown inputs) and
+      # shellcheck errors; shellcheck's style/info/warning notes are listed as warnings.
+      - name: Run actionlint
+        if: ${{ !cancelled() }}
+        run: |
+          cd "$RUNNER_TEMP"
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
+          cd "$GITHUB_WORKSPACE"
+          "$RUNNER_TEMP/actionlint" -format '{{json .}}' > "$RUNNER_TEMP/actionlint.json" || true
+          jq '(. // []) as $all
+            | ($all | map(select(.kind == "shellcheck" and (.message | test(":(style|info|warning):"))))) as $notes
+            | {
+                errors: [$all[] | select(. as $f | any($notes[]; . == $f) | not) | "`\(.filepath):\(.line):\(.column)` \(.message)"],
+                warnings: [$notes[] | "`\(.filepath):\(.line):\(.column)` \(.message)"]
+              }' "$RUNNER_TEMP/actionlint.json" > "$RESULTS/actionlint.json"
+          jq -c '{errors: (.errors | length), warnings: (.warnings | length)}' "$RESULTS/actionlint.json"
+
+      - name: Build the plugin
+        if: ${{ !cancelled() }}
+        run: |
+          chmod +x ./gradlew
+          if ./gradlew build --stacktrace 2>&1 | tee "$RUNNER_TEMP/build.log"; then
+            jq -n '{errors: [], warnings: []}' > "$RESULTS/build.json"
+          else
+            ERROR=$(sed -n '/^\* What went wrong:/,/^\* Try:/p' "$RUNNER_TEMP/build.log" | grep -vE '^\* (What went wrong|Try):' \
+              | grep . | head -10 | tr '\n' ' ')
+            jq -n --arg e "./gradlew build failed: ${ERROR:-see the workflow run}" '{errors: [$e], warnings: []}' > "$RESULTS/build.json"
+          fi
+
+      - name: Post the results on the PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          set +e
+          python3 .github/scripts/pr_checks_report.py "$RESULTS" "$RUNNER_TEMP/comment.md"
+          echo "$?" > "$RUNNER_TEMP/failed"
+          set -e
+          MARKER="<!-- build-tools-pr-checks -->"
+          COMMENT_ID=$(gh api --paginate "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
+            --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" | tail -1)
+          if [ -n "$COMMENT_ID" ]; then
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/$COMMENT_ID" -F "body=@$RUNNER_TEMP/comment.md" > /dev/null
+          else
+            gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body-file "$RUNNER_TEMP/comment.md"
+          fi
+
+      - name: Fail on errors
+        if: always()
+        run: |
+          if [ "$(cat "$RUNNER_TEMP/failed" 2>/dev/null || echo 1)" != 0 ]; then
+            echo "::error::A PR check has errors - see the PR comment."
+            exit 1
+          fi
