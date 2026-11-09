@@ -23,6 +23,7 @@ import org.gradle.testing.jacoco.tasks.JacocoReport
 import java.io.File
 import java.io.FileInputStream
 import java.util.Properties
+import java.util.concurrent.Callable
 
 plugins {
     id("jacoco")
@@ -322,6 +323,58 @@ tasks.register<JacocoReport>("combinedJacocoReport") {
     executionData.setFrom(files(modules.map { moduleExecData(it) }))
 }
 
+// ---- UI (instrumented) test coverage --------------------------------------------
+// connected<Variant>AndroidTest, with android.buildTypes.debug {
+// enableAndroidTestCoverage = true }, writes .ec files under
+// outputs/code_coverage/<variant>AndroidTest/connected/<device>/. This report is kept
+// apart from the unit-test ones (CI shows the two figures separately) and doesn't
+// depend on the connected task, which needs a device: CI runs both in one Gradle call
+// and mustRunAfter keeps the order. A module without UI tests or without the flag
+// contributes nothing, as with the unit-test reports.
+val coverageUiTestTask = "connected${coverageVariantTask}AndroidTest"
+
+fun moduleUiTestExecData(module: Project) = fileTree(module.layout.buildDirectory.get()) {
+    include("outputs/code_coverage/${coverageVariant}AndroidTest/connected/**/*.ec")
+}
+
+// The classes the UI tests ran: AGP's ASM-transform output, where Hilt has rewritten its
+// @HiltAndroidApp/@AndroidEntryPoint classes (the compilers' copies of those don't match the
+// .ec data, so JaCoCo would count them as 0%), less the classes hiltJavaCompile adds there
+// (Dagger components etc.), so the same classes are measured as from the compilers. Read when
+// the task runs, as the folder may not exist yet at configuration; a module without an ASM
+// transform falls back to the compilers' output.
+fun moduleUiTestClassDirs(module: Project) = files(Callable {
+    val variantClasses = module.layout.buildDirectory.get().asFile.resolve("intermediates/classes/$coverageVariant")
+    val transformed = variantClasses.resolve("transform${coverageVariantTask}ClassesWithAsm/dirs")
+    if (!transformed.isDirectory) return@Callable moduleClassDirs(module)
+    val hiltGenerated = variantClasses.resolve("hiltJavaCompile$coverageVariantTask")
+    fileTree(transformed) {
+        include("**/*.class")
+        exclude(jacocoFileFilter)
+        exclude { !it.isDirectory && hiltGenerated.resolve(it.relativePath.pathString).isFile }
+    }
+})
+
+tasks.register<JacocoReport>("uiTestJacocoReport") {
+    group = "verification"
+    description = "Generates one merged JaCoCo report of the instrumented (UI) tests across every subproject."
+
+    val modules = project.rootProject.subprojects
+
+    modules.forEach { module ->
+        mustRunAfter(module.tasks.matching { it.name == coverageUiTestTask })
+    }
+
+    reports {
+        xml.required.set(true)
+        html.required.set(true)
+    }
+
+    sourceDirectories.setFrom(files(modules.flatMap { moduleSourceDirs(it) }))
+    classDirectories.setFrom(files(modules.map { moduleUiTestClassDirs(it) }))
+    executionData.setFrom(files(modules.map { moduleUiTestExecData(it) }))
+}
+
 // Writes every subproject's name, one per line, to a file CI can just `cat` -
 // the actual live Gradle project model, not a text-parsed guess at
 // settings.gradle.kts's include(...) syntax (which varies: one include() per
@@ -356,6 +409,7 @@ tasks.register("listCoverageModules") {
 //   FREE_FIREBASE_APP_ID=1:123:android:abc      (from google-services.json, when it has the package)
 //   FREE_DEBUG_ASSEMBLE_TASK=assembleFreeDebug
 //   FREE_DEBUG_TEST_TASK=testFreeDebugUnitTest
+//   FREE_DEBUG_UI_TEST_TASK=connectedFreeDebugAndroidTest
 //   FREE_DEBUG_VARIANT=freeDebug                 (coverageVariant)
 //   FREE_DEBUG_APK_DIR=app/build/outputs/apk/free/debug
 //   FREE_RELEASE_BUNDLE_TASK=bundleFreeRelease
@@ -444,6 +498,7 @@ tasks.register("printAppInfo") {
                 val cap = v.variantName.replaceFirstChar { it.uppercase() }
                 lines += "${key}_DEBUG_ASSEMBLE_TASK=assemble$cap"
                 lines += "${key}_DEBUG_TEST_TASK=test${cap}UnitTest"
+                lines += "${key}_DEBUG_UI_TEST_TASK=connected${cap}AndroidTest"
                 lines += "${key}_DEBUG_VARIANT=${v.variantName}"
                 lines += "${key}_DEBUG_APK_DIR=$moduleDir/build/outputs/apk/${apkFlavorDir}debug"
             }

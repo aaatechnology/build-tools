@@ -128,6 +128,25 @@ both admin-only settings:
   and this workflow's status check (`build / build`), or auto-merge has nothing to
   wait for and merges as soon as the build passes with no review at all.
 
+**UI tests (from 0.15.0):** `run_ui_tests` (optional, default `false`) also runs each
+built flavour's instrumented tests (`connected<Variant>AndroidTest`) on an Android
+emulator (`reactivecircus/android-emulator-runner`, a `google_apis` x86_64 image at
+`ui_test_api_level`, default `36`, with KVM on the standard `ubuntu-latest` runner) and
+adds **UI tests** (passed/total, and the failing ones) and **UI test coverage** to each
+flavour in the PR comment. It's slow (an emulator boot, then each flavour's suite), so a
+caller usually turns it on for release PRs only:
+
+```yaml
+    with:
+      run_ui_tests: ${{ github.event.pull_request.base.ref == 'main' }}
+```
+
+The coverage comes from the plugin's `uiTestJacocoReport` and needs
+`android.buildTypes.debug { enableAndroidTestCoverage = true }` in the app; without it the
+comment says the report wasn't found. By default the UI tests only report: a failing test
+or an emulator that won't start shows ❌ in the comment (and uploads the reports artifact)
+but doesn't fail the check. Set `fail_on_ui_test_failure: true` to make it fail.
+
 **Comment-triggered rebuilds:** the `issue_comment`/`if:` block above is entirely the
 calling repo's responsibility - this reusable workflow itself doesn't declare or filter
 on any trigger (it's `workflow_call`-only), it just needs to resolve the same PR head/
@@ -310,6 +329,15 @@ the reference consumer.
   (the same flag this plugin's own per-module Jacoco setup relies on) just
   contributes 0% instead of failing the build - it produces no `.exec`/class data
   to merge, so there's nothing to configure or pre-filter.
+- A `uiTestJacocoReport` task (from 0.15.0, output under
+  `build/reports/jacoco/uiTestJacocoReport/`): the same merge across every subproject,
+  but of the instrumented tests' `.ec` data
+  (`outputs/code_coverage/<variant>AndroidTest/connected/`), which
+  `connected<Variant>AndroidTest` writes when the module sets
+  `android.buildTypes.debug { enableAndroidTestCoverage = true }`. It doesn't run the
+  connected tests itself (they need a device): run both in one call, e.g.
+  `./gradlew connectedFreeDebugAndroidTest uiTestJacocoReport -PcoverageVariant=freeDebug`.
+  `printAppInfo` prints each flavour's connected task as `<FLAVOR>_DEBUG_UI_TEST_TASK`.
 - Release signing: `signingConfigs["release"]` reads `../key/keystore.properties`
   (the default, `SigningKeyVersion.V2`) or `../key/keystore1.properties`
   (`SigningKeyVersion.V1`) - selected via `appConfig { signingKeyVersion = ... }`

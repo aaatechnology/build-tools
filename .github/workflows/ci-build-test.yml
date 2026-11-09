@@ -27,6 +27,11 @@
 # from the com.aaatech.build-tools plugin's printAppInfo task (>= 0.14.0), not from inputs,
 # so it can't drift from the app's Gradle setup. An app without flavours has exactly one,
 # named "default".
+#
+# UI tests (from 0.15.0, opt-in with run_ui_tests): after a successful build, each flavour's
+# instrumented tests run on one Android emulator, and the comment adds their results and
+# coverage (the plugin's uiTestJacocoReport). They only report by default;
+# fail_on_ui_test_failure makes them fail the check.
 
 name: Android Debug CI (reusable)
 
@@ -64,6 +69,29 @@ on:
           an approving review) on develop before actually merging - this only queues
           it, it does not bypass review. Has no effect on PRs targeting any other
           branch, or on non-pull_request triggers.
+        required: false
+        type: boolean
+        default: false
+      run_ui_tests:
+        description: >-
+          If true, also run each built flavour's instrumented (UI) tests on an Android
+          emulator and report their results and coverage in the PR comment. Slow (an
+          emulator boot plus the suite per flavour), so callers usually set it only for
+          release PRs, e.g. `github.event.pull_request.base.ref == 'main'`. The app needs
+          android.buildTypes.debug { enableAndroidTestCoverage = true } for the coverage.
+        required: false
+        type: boolean
+        default: false
+      ui_test_api_level:
+        description: 'Android API level of the emulator the UI tests run on (a google_apis x86_64 image)'
+        required: false
+        type: string
+        default: '36'
+      fail_on_ui_test_failure:
+        description: >-
+          If true, failing UI tests (or an emulator that won't start) fail this check.
+          False by default: the results are only reported, so a flaky emulator run
+          doesn't block the PR while the suite settles in CI.
         required: false
         type: boolean
         default: false
@@ -311,14 +339,151 @@ jobs:
           done
           [ "$ANY_FAILED" = false ]
 
-      # When the build fails: each flavour's test and coverage reports, so a failing test can
-      # be read in its HTML report; the PR comment links to it. Failures only, reports only (no
-      # APKs) and kept 3 days - artifacts count toward the account's storage quota, which an
-      # upload nobody read once filled (see top). build-tools' Artifact Housekeeping also
-      # deletes anything older than 3 days in every repo.
+      # UI tests (opt-in, run_ui_tests): one emulator for every flavour, after a successful
+      # build. The emulator needs KVM, which standard ubuntu-latest runners have but don't
+      # open to the runner user by default.
+      - name: Enable KVM for the emulator
+        if: inputs.run_ui_tests && steps.build.outcome == 'success'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # The emulator action runs its `script` one line at a time with sh, so the per-flavour
+      # loop lives in a bash file. For each flavour that built: its connected tests and the
+      # uiTestJacocoReport (--continue, so coverage is still measured when a test fails), its
+      # results, failing tests and coverage for the PR comment, and its reports in $REPORTS.
+      - name: Write the UI test script
+        if: inputs.run_ui_tests && steps.build.outcome == 'success'
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/ui-tests.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -o pipefail
+
+          var() {
+            local key
+            key=$(printf '%s' "$1" | sed -E 's/([a-z0-9])([A-Z])/\1_\2/g; s/[^A-Za-z0-9]/_/g' | tr '[:lower:]' '[:upper:]')
+            local name="${key}_$2"
+            printf '%s' "${!name}"
+          }
+
+          parse_counts() {
+            local report="$1"
+            if [ -f "$report" ]; then
+              local line_counter missed covered
+              line_counter=$(grep -o '<counter type="LINE"[^/]*/>' "$report" | tail -1)
+              missed=$(echo "$line_counter" | grep -oE 'missed="[0-9]+"' | grep -oE '[0-9]+')
+              covered=$(echo "$line_counter" | grep -oE 'covered="[0-9]+"' | grep -oE '[0-9]+')
+              echo "$covered $((missed + covered))"
+            fi
+          }
+
+          format_pct() {
+            local covered="$1" total="$2"
+            if [ "$total" -gt 0 ]; then
+              awk "BEGIN { printf \"%.1f\", ($covered / $total) * 100 }"
+            else
+              echo "0.0"
+            fi
+          }
+
+          # "<passed>/<total> passed" into $2/ui-tests and the failing tests (at most 20) into
+          # $2/ui-failed-tests, from the connected test XML of flavour $1 ("default": unflavoured).
+          ui_results() {
+            python3 - "$1" "$2" <<'PY'
+          import glob, os, sys, xml.etree.ElementTree as ET
+          flavor, out = sys.argv[1], sys.argv[2]
+          total, failed = 0, []
+          for f in sorted(glob.glob("**/build/outputs/androidTest-results/connected/**/*.xml", recursive=True)):
+              if flavor != "default" and f"/flavors/{flavor}/" not in f:
+                  continue
+              try:
+                  root = ET.parse(f).getroot()
+              except ET.ParseError:
+                  continue
+              for case in root.iter("testcase"):
+                  total += 1
+                  bad = case.find("failure")
+                  if bad is None:
+                      bad = case.find("error")
+                  if bad is not None:
+                      cls = case.get("classname", "").rsplit(".", 1)[-1]
+                      msg = (bad.get("message") or bad.text or "").strip().splitlines()
+                      msg = msg[0][:200] if msg else ""
+                      failed.append(f"- `{cls} > {case.get('name')}`" + (f": {msg}" if msg else ""))
+          with open(os.path.join(out, "ui-tests"), "w") as fh:
+              fh.write(f"{total - len(failed)}/{total} passed\n" if total else "no results found\n")
+          with open(os.path.join(out, "ui-failed-tests"), "w") as fh:
+              fh.write("\n".join(failed[:20]) + (f"\n- …and {len(failed) - 20} more" if len(failed) > 20 else ""))
+          PY
+          }
+
+          # Copies every module's connected test results and UI coverage report into $REPORTS.
+          keep_ui_reports() {
+            local dest="$REPORTS/$1"
+            mkdir -p "$dest"
+            find . -path ./.git -prune -o -type d \( -path '*/build/reports/androidTests' \
+              -o -path '*/build/outputs/androidTest-results' -o -path '*/build/reports/jacoco/uiTestJacocoReport' \) \
+              -print 2>/dev/null | while IFS= read -r dir; do
+              mkdir -p "$dest/${dir#./}"
+              cp -R "$dir/." "$dest/${dir#./}/"
+            done
+          }
+
+          ANY_FAILED=false
+          for FLAVOR in $APP_FLAVORS; do
+            OUT="$FLAVOR_RESULTS/$FLAVOR"
+            [ "$(cat "$OUT/status" 2>/dev/null)" = success ] || continue
+            echo "::group::UI tests: $FLAVOR"
+
+            if ./gradlew --continue "$(var "$FLAVOR" DEBUG_UI_TEST_TASK)" uiTestJacocoReport \
+              "-PcoverageVariant=$(var "$FLAVOR" DEBUG_VARIANT)" 2>&1 | tee "$OUT/ui-gradle.log"; then
+              echo success > "$OUT/ui-status"
+            else
+              echo failure > "$OUT/ui-status"
+              ANY_FAILED=true
+              sed -n '/^\* What went wrong:/,/^\* Try:/p' "$OUT/ui-gradle.log" | grep -v '^\* Try:' | head -15 > "$OUT/ui-error"
+            fi
+            ui_results "$FLAVOR" "$OUT"
+            keep_ui_reports "$FLAVOR"
+
+            read -r UI_COVERED UI_TOTAL <<< "$(parse_counts "app/build/reports/jacoco/uiTestJacocoReport/uiTestJacocoReport.xml")"
+            if [ -z "${UI_TOTAL:-}" ]; then
+              echo "unavailable (report not found - is enableAndroidTestCoverage on?)" > "$OUT/ui-coverage"
+            else
+              echo "$(format_pct "$UI_COVERED" "$UI_TOTAL")% lines covered (${UI_COVERED}/${UI_TOTAL})" > "$OUT/ui-coverage"
+            fi
+            echo "$FLAVOR UI tests: $(cat "$OUT/ui-tests"), coverage $(cat "$OUT/ui-coverage")"
+            echo "::endgroup::"
+          done
+          [ "$ANY_FAILED" = false ]
+          SCRIPT
+
+      # Fails (and so fails the check) only with fail_on_ui_test_failure; otherwise the results
+      # are reported and the step's failure stays out of the check.
+      - name: Run UI tests on an emulator
+        id: ui_tests
+        if: inputs.run_ui_tests && steps.build.outcome == 'success'
+        continue-on-error: ${{ !inputs.fail_on_ui_test_failure }}
+        timeout-minutes: 90
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ inputs.ui_test_api_level }}
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: bash "$RUNNER_TEMP/ui-tests.sh"
+
+      # Each flavour's test and coverage reports, so a failing test can be read in its HTML
+      # report; the PR comment links to it. Only when the build or the UI tests failed, reports
+      # only (no APKs) and kept 3 days - artifacts count toward the account's storage quota,
+      # which an upload nobody read once filled (see top). build-tools' Artifact Housekeeping
+      # also deletes anything older than 3 days in every repo.
       - name: Upload test and coverage reports
         id: reports
-        if: failure()
+        if: failure() || steps.ui_tests.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
           name: test-reports-attempt-${{ github.run_attempt }}
@@ -456,6 +621,7 @@ jobs:
           DISPLAY_NAME: ${{ inputs.app_display_name }}
           UPLOAD: ${{ inputs.upload_to_firebase }}
           BUILD_OUTCOME: ${{ steps.build.outcome }}
+          RUN_UI_TESTS: ${{ inputs.run_ui_tests }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
           REPORTS_URL: ${{ steps.reports.outputs.artifact-url }}
         run: |
@@ -511,8 +677,27 @@ jobs:
                 echo "- **Version:** $(cat "$OUT/version_name"), Version Code: $(cat "$OUT/version_code")"
                 echo "- **Unit test coverage:** $(cat "$OUT/coverage")"
                 cat "$OUT/coverage-breakdown"
+                if [ -f "$OUT/ui-status" ]; then
+                  UI_ICON=""
+                  [ "$(cat "$OUT/ui-status")" != "success" ] && UI_ICON="❌ "
+                  echo "- **UI tests:** ${UI_ICON}$(cat "$OUT/ui-tests" 2>/dev/null || echo 'no results found')"
+                  echo "- **UI test coverage:** $(cat "$OUT/ui-coverage" 2>/dev/null || echo 'unavailable')"
+                elif [ "$RUN_UI_TESTS" = "true" ]; then
+                  echo "- **UI tests:** ❌ didn't run (the emulator didn't start - check the workflow run)"
+                fi
                 if [ "$UPLOAD" = "true" ]; then
                   echo "- **Firebase:** $(cat "$OUT/firebase" 2>/dev/null || echo '❌ not uploaded - check the workflow run')"
+                fi
+                if [ -s "$OUT/ui-failed-tests" ] && grep -q . "$OUT/ui-failed-tests"; then
+                  echo
+                  echo "**Failing UI tests:**"
+                  cat "$OUT/ui-failed-tests"
+                elif [ -s "$OUT/ui-error" ]; then
+                  echo
+                  echo "**UI tests (Gradle):**"
+                  echo '```'
+                  cat "$OUT/ui-error"
+                  echo '```'
                 fi
               elif [ "$STATUS" = "failure" ]; then
                 if [ -s "$OUT/failed-tests" ] && grep -q . "$OUT/failed-tests"; then
