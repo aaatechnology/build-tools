@@ -506,9 +506,9 @@ jobs:
           if [ -z "$COMMIT_MESSAGE_SUBJECT" ]; then
             COMMIT_MESSAGE_SUBJECT="(commit message unavailable)"
           fi
-          echo "COMMIT_SHA=$COMMIT_SHA" >> $GITHUB_ENV
-          echo "COMMIT_SHA_SHORT=$COMMIT_SHA_SHORT" >> $GITHUB_ENV
-          echo "COMMIT_MESSAGE_SUBJECT=$COMMIT_MESSAGE_SUBJECT" >> $GITHUB_ENV
+          echo "COMMIT_SHA=$COMMIT_SHA" >> "$GITHUB_ENV"
+          echo "COMMIT_SHA_SHORT=$COMMIT_SHA_SHORT" >> "$GITHUB_ENV"
+          echo "COMMIT_MESSAGE_SUBJECT=$COMMIT_MESSAGE_SUBJECT" >> "$GITHUB_ENV"
 
       # Recent Changes: for a PR, only the commits this PR actually introduces
       # (base..head) - not the target branch's whole history. For a direct push
@@ -526,16 +526,16 @@ jobs:
             COMMIT_MESSAGES="• Latest development build"
           fi
 
-          echo "COMMIT_MESSAGES<<EOF" >> $GITHUB_ENV
-          echo "$COMMIT_MESSAGES" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
+          echo "COMMIT_MESSAGES<<EOF" >> "$GITHUB_ENV"
+          echo "$COMMIT_MESSAGES" >> "$GITHUB_ENV"
+          echo "EOF" >> "$GITHUB_ENV"
 
       # Get current timestamp for release notes (IST, not the runner's default UTC)
       - name: Get current timestamp
         if: always()
         run: |
           CURRENT_DATE=$(TZ='Asia/Kolkata' date +'%Y-%m-%d %H:%M:%S IST')
-          echo "CURRENT_DATE=$CURRENT_DATE" >> $GITHUB_ENV
+          echo "CURRENT_DATE=$CURRENT_DATE" >> "$GITHUB_ENV"
 
       # One upload per flavour, each to its own Firebase app (from google-services.json via
       # printAppInfo). The firebase_app_id secret is only a fallback for an app with a single

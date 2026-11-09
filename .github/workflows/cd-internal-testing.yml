@@ -188,12 +188,12 @@ jobs:
               | tr -d '[:space:]')
           fi
 
-          echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_ENV
-          echo "RELEASE_NOTES<<EOF" >> $GITHUB_ENV
-          echo "$NOTES" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
-          echo "VERSION_BUMP=$VERSION_BUMP" >> $GITHUB_ENV
-          echo "NOTES_FROM_PR=$NOTES_FROM_PR" >> $GITHUB_ENV
+          echo "PR_NUMBER=$PR_NUMBER" >> "$GITHUB_ENV"
+          echo "RELEASE_NOTES<<EOF" >> "$GITHUB_ENV"
+          echo "$NOTES" >> "$GITHUB_ENV"
+          echo "EOF" >> "$GITHUB_ENV"
+          echo "VERSION_BUMP=$VERSION_BUMP" >> "$GITHUB_ENV"
+          echo "NOTES_FROM_PR=$NOTES_FROM_PR" >> "$GITHUB_ENV"
           echo "Version bump requested: ${VERSION_BUMP:-patch (default)}"
 
       # Computed BEFORE building (not read back from the build afterward): the build
@@ -236,10 +236,10 @@ jobs:
             RELEASE_VERSION_NAME="${MAJOR}.${MINOR}.${PATCH}"
           fi
 
-          echo "RELEASE_VERSION_NAME=$RELEASE_VERSION_NAME" >> $GITHUB_ENV
-          echo "RELEASE_TAG=${RELEASE_VERSION_NAME}" >> $GITHUB_ENV
-          echo "RERELEASE=$RERELEASE" >> $GITHUB_ENV
-          echo "VERSION_CODE=$(git rev-list --count HEAD)" >> $GITHUB_ENV
+          echo "RELEASE_VERSION_NAME=$RELEASE_VERSION_NAME" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=${RELEASE_VERSION_NAME}" >> "$GITHUB_ENV"
+          echo "RERELEASE=$RERELEASE" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
 
       # "same" re-release: refuse if the version's GitHub release was already published
       # (it may be in production - ship a patch instead), then aggregate release notes:
@@ -265,9 +265,9 @@ jobs:
           fi
           COMBINED=$(printf '%s\n' "$COMBINED" | sed '/^[[:space:]]*$/d' | awk '!seen[$0]++')
 
-          echo "RELEASE_NOTES<<EOF" >> $GITHUB_ENV
-          echo "$COMBINED" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
+          echo "RELEASE_NOTES<<EOF" >> "$GITHUB_ENV"
+          echo "$COMBINED" >> "$GITHUB_ENV"
+          echo "EOF" >> "$GITHUB_ENV"
           echo "Re-releasing $RELEASE_TAG with aggregated notes:"
           echo "$COMBINED"
 
@@ -293,7 +293,7 @@ jobs:
             TASKS+=("$(var "$FLAVOR" RELEASE_BUNDLE_TASK)" "$(var "$FLAVOR" RELEASE_ASSEMBLE_TASK)")
           done
           ./gradlew "${TASKS[@]}" \
-            -PreleaseVersionName=$RELEASE_VERSION_NAME -PreleaseVersionCode=$VERSION_CODE
+            "-PreleaseVersionName=$RELEASE_VERSION_NAME" "-PreleaseVersionCode=$VERSION_CODE"
 
           mkdir -p "$RELEASE_ASSETS"
           for FLAVOR in $APP_FLAVORS; do
@@ -537,7 +537,7 @@ jobs:
           if (cd "$WORKTREE" \
               && git merge --no-ff --no-edit -m "Back-merge $RELEASE_TAG from main into $TARGET" "${{ github.sha }}" \
               && git push origin "HEAD:$TARGET"); then
-            echo "BACK_MERGE_STATUS=✅ merged into $TARGET" >> $GITHUB_ENV
+            echo "BACK_MERGE_STATUS=✅ merged into $TARGET" >> "$GITHUB_ENV"
           else
             (cd "$WORKTREE" && git merge --abort 2>/dev/null || true)
             PR_URL=$(gh pr create --repo "${{ github.repository }}" \
@@ -545,7 +545,7 @@ jobs:
               --title "Back-merge $RELEASE_TAG into $TARGET" \
               --body "Automatic back-merge after releasing $RELEASE_TAG failed (merge conflict or rejected push). Merge this so $TARGET has the release tag and a versionCode ahead of the release." \
               2>&1 || true)
-            echo "BACK_MERGE_STATUS=⚠️ automatic merge into $TARGET failed - PR: $PR_URL" >> $GITHUB_ENV
+            echo "BACK_MERGE_STATUS=⚠️ automatic merge into $TARGET failed - PR: $PR_URL" >> "$GITHUB_ENV"
           fi
           git worktree remove --force "$WORKTREE" || true
 
