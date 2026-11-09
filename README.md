@@ -373,11 +373,23 @@ the reference consumer.
    account) as a job-level `env:` - `secrets: inherit` on the caller side is
    enough as long as the caller repo's secret is named `GH_PACKAGES_READ_TOKEN`.
 
-**Publishing a new version:** bump `version` in this repo's root `build.gradle.kts`
-and push to `main` - `.github/workflows/publish-plugin.yml` publishes automatically
-on any push touching `build.gradle.kts`, `settings.gradle.kts`, `src/**`, or
-`gradle/**` (or trigger it manually via `workflow_dispatch`). Versioning is manual,
-not git-tag-driven like the app repos.
+**Publishing a new version:** every change goes through a PR into `main`, written from
+`.github/pull_request_template.md` (summary, changes by area, impact on app repos,
+**Version Bump**, test plan, **Release Notes**). Don't edit `version` in
+`build.gradle.kts` yourself.
+
+- `.github/workflows/pr-checks.yml` checks the PR on every push and description edit, and
+  keeps one comment on it with the results and a link to the run: the description follows
+  the template, the bump fits what changed (and the version merging would release),
+  `actionlint` on every workflow, and `./gradlew build`. Errors fail the check; warnings
+  (e.g. shellcheck style/info notes) are only listed.
+- `.github/workflows/publish-plugin.yml` releases on merge: the PR's Version Bump
+  (`patch`/`minor`/`major`) applied to the latest `X.Y.Z` tag gives the version, which it
+  commits to `main` as `Release X.Y.Z (#PR)`, publishes to GitHub Packages, tags (the same
+  tag pins the reusable workflows) and turns into a GitHub release with the PR's Release
+  Notes, then comments the result on the PR. `none` releases nothing. A failed release can
+  be re-run: it carries on from the PR's release commit. To release without a PR (e.g.
+  after a direct push to `main`), run it by hand (`workflow_dispatch`) with a bump.
 
 ### `artifact-housekeeping.yml`
 

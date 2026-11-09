@@ -1,38 +1,64 @@
-# Publishes the com.aaatech.build-tools Gradle plugin (src/main/kotlin/) to this repo's
-# GitHub Packages Maven registry, so app repos (e.g. AgeCalculator) can resolve it via
-# plugins { id("com.aaatech.build-tools") version "..." }. GITHUB_TOKEN already has write
-# access to this repo's own packages - no extra secret needed to publish.
+# Releases build-tools when a PR into main is merged: the com.aaatech.build-tools Gradle
+# plugin (src/main/kotlin/) goes to this repo's GitHub Packages Maven registry, and the same
+# version becomes a git tag + GitHub release (no "v" prefix, e.g. 0.15.0), so app repos pin
+# both the plugin (plugins { id("com.aaatech.build-tools") version "0.15.0" }) and the
+# reusable workflows (uses: aaatechnology/build-tools/.github/workflows/<file>.yml@0.15.0).
 #
-# Each new `version` in build.gradle.kts is also cut as a git tag + GitHub release with
-# the same name (no "v" prefix, e.g. 0.11.0), so app repos can pin the reusable workflows
-# too: uses: aaatechnology/build-tools/.github/workflows/<file>.yml@0.11.0. A push that
-# doesn't bump `version` (e.g. a workflow-only change) publishes nothing and cuts no tag.
+# The version comes from the merged PR's description (.github/pull_request_template.md):
+# its `## Version Bump` (patch, minor or major) applied to the latest X.Y.Z tag. This
+# workflow writes it into build.gradle.kts as a "Release X.Y.Z (#PR)" commit on main,
+# publishes from that commit, then tags it and creates the release from the PR's
+# `## Release Notes`. `none` (or no Version Bump) releases nothing. The result is posted
+# on the PR. GITHUB_TOKEN can publish this repo's packages and push to main (main has no
+# branch protection); its commits don't trigger workflows, so the release commit doesn't
+# start another run.
+#
+# Re-running a failed release is safe: it finds the PR's release commit and carries on
+# from it (publish, tag) instead of bumping again. One case needs a hand: if the publish
+# succeeded but the tag didn't, a re-run fails at the publish (packages are immutable per
+# version) - create the tag and release on the "Release X.Y.Z" commit instead.
+#
+# workflow_dispatch releases main as it is, with a bump chosen by hand (e.g. after a direct
+# push, which no longer releases by itself).
 
-name: Publish Build Tools Plugin
+name: Release Build Tools
 
 on:
-  push:
+  pull_request:
     branches: [ main ]
-    paths:
-      - 'build.gradle.kts'
-      - 'settings.gradle.kts'
-      - 'src/**'
-      - 'gradle/**'
-      - '.github/workflows/**'
+    types: [ closed ]
   workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump from the latest tag'
+        required: true
+        type: choice
+        options: [ patch, minor, major ]
 
 permissions:
   contents: write
   packages: write
+  pull-requests: write
 
+# One release at a time, and never cancelled halfway (between the commit and the tag).
 concurrency:
-  group: publish-plugin-${{ github.ref }}
+  group: release-build-tools
+  cancel-in-progress: false
 
 jobs:
-  publish:
+  release:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
+    env:
+      # Written by whoever opened the PR, so it's only ever read from the environment.
+      PR_BODY: ${{ github.event.pull_request.body }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      DISPATCH_BUMP: ${{ inputs.bump }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
 
       - name: Set up JDK
         uses: actions/setup-java@v5
@@ -44,40 +70,115 @@ jobs:
       - name: Change wrapper permissions
         run: chmod +x ./gradlew
 
-      # Packages are immutable per version, so an already-released version can't be
-      # re-published - skip everything until `version` is bumped.
-      - name: Check whether this version is already released
+      # Sets version (X.Y.Z, or empty when nothing is released) and commit (the release
+      # commit to publish and tag), creating and pushing that commit unless a re-run finds it.
+      - name: Work out the version and commit it
         id: version
         run: |
-          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' build.gradle.kts)
-          if [ -z "$VERSION" ]; then
-            echo "::error::Could not read version from build.gradle.kts"
-            exit 1
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          if git ls-remote --exit-code --tags origin "refs/tags/$VERSION" >/dev/null 2>&1; then
-            echo "::notice::$VERSION is already released (tag exists) - nothing published. Bump version in build.gradle.kts to cut a new release."
-            echo "released=true" >> $GITHUB_OUTPUT
-          else
-            echo "released=false" >> $GITHUB_OUTPUT
+          LATEST=$(git tag --list | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          SUFFIX=""
+          [ -n "$PR_NUMBER" ] && SUFFIX=" (#$PR_NUMBER)"
+
+          # A re-run of this PR's release: carry on from its commit.
+          if [ -n "$PR_NUMBER" ]; then
+            EXISTING=$(git log origin/main --format='%H %s' --grep="^Release [0-9.]* (#$PR_NUMBER)\$" -1)
+            if [ -n "$EXISTING" ]; then
+              VERSION=$(echo "$EXISTING" | sed -E 's/^[0-9a-f]+ Release ([0-9.]+) .*/\1/')
+              if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+                echo "::notice::$VERSION is already released for #$PR_NUMBER - nothing to do."
+                echo "version=" >> "$GITHUB_OUTPUT"
+                echo "skipped=already released as $VERSION" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              git checkout -q "${EXISTING%% *}"
+              echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+              echo "commit=${EXISTING%% *}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
 
+          BUMP="${DISPATCH_BUMP:-$(python3 .github/scripts/pr_body.py bump)}"
+          if [ -z "$BUMP" ] || [ "$BUMP" = none ]; then
+            echo "::notice::Version Bump is ${BUMP:-missing} - nothing released."
+            echo "version=" >> "$GITHUB_OUTPUT"
+            echo "skipped=Version Bump is ${BUMP:-missing}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          VERSION=$(BUMP="$BUMP" python3 .github/scripts/pr_body.py next "${LATEST:-0.0.0}")
+
+          sed -i -E "s/^version = \".*\"\$/version = \"$VERSION\"/" build.gradle.kts
+          grep -q "^version = \"$VERSION\"\$" build.gradle.kts || { echo "::error::Couldn't set version in build.gradle.kts"; exit 1; }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add build.gradle.kts
+          # --allow-empty: the version may already read $VERSION; the commit still marks the release.
+          git commit -q --allow-empty -m "Release $VERSION$SUFFIX"
+          git push origin HEAD:main
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Releasing $VERSION ($BUMP after ${LATEST:-no tag})"
+
       - name: Publish to GitHub Packages
-        if: steps.version.outputs.released == 'false'
+        if: steps.version.outputs.version != ''
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./gradlew publish --stacktrace
 
       # Only after a successful publish, so a tag always means "this version exists in
-      # GitHub Packages" and pins both the plugin and the workflows at this commit.
-      - name: Cut release tag
-        if: steps.version.outputs.released == 'false'
+      # GitHub Packages" and pins both the plugin and the workflows at the release commit.
+      - name: Tag and create the release
+        id: release
+        if: steps.version.outputs.version != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
+          COMMIT: ${{ steps.version.outputs.commit }}
         run: |
-          git tag "$VERSION" "${{ github.sha }}"
+          git tag "$VERSION" "$COMMIT"
           git push origin "refs/tags/$VERSION"
-          gh release create "$VERSION" --repo "${{ github.repository }}" \
-            --title "$VERSION" --generate-notes
+          if [ -n "$PR_NUMBER" ]; then
+            {
+              python3 .github/scripts/pr_body.py notes
+              echo
+              echo "**PR:** #$PR_NUMBER"
+            } > "$RUNNER_TEMP/notes.md"
+            gh release create "$VERSION" --repo "${{ github.repository }}" --title "$VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+          else
+            gh release create "$VERSION" --repo "${{ github.repository }}" --title "$VERSION" --generate-notes
+          fi
+          echo "url=${{ github.server_url }}/${{ github.repository }}/releases/tag/$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Post the result on the PR
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          SKIPPED: ${{ steps.version.outputs.skipped }}
+          RELEASE_URL: ${{ steps.release.outputs.url }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          {
+            if [ "$JOB_STATUS" != success ]; then
+              echo "## ❌ Release failed${VERSION:+ ($VERSION)}"
+              echo
+              echo "🔗 [Workflow run]($RUN_URL). Re-run it once fixed: it carries on from this PR's release commit."
+            elif [ -z "$VERSION" ]; then
+              echo "## ⏭️ No release"
+              echo
+              echo "$SKIPPED. 🔗 [Workflow run]($RUN_URL)"
+            else
+              echo "## 🚀 Released $VERSION"
+              echo
+              echo "🔗 [Release]($RELEASE_URL) · [Workflow run]($RUN_URL)"
+              echo
+              echo "Pin it in an app repo:"
+              echo
+              echo '```'
+              echo "aaatechBuildTools = \"$VERSION\"   # gradle/libs.versions.toml"
+              echo "uses: aaatechnology/build-tools/.github/workflows/ci-build-test.yml@$VERSION"
+              echo '```'
+            fi
+          } > "$RUNNER_TEMP/comment.md"
+          gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body-file "$RUNNER_TEMP/comment.md"
