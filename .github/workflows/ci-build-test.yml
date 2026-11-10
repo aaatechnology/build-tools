@@ -125,10 +125,14 @@ jobs:
       GH_PACKAGES_READ_TOKEN: ${{ secrets.gh_packages_read_token }}
       # Per-flavour results (APK path, version, coverage, Firebase status), one folder each.
       FLAVOR_RESULTS: ${{ github.workspace }}/../flavor-results
-      # Each flavour's unit-test and Jacoco reports, uploaded as the run's reports artifact.
-      REPORTS: ${{ github.workspace }}/../reports
 
     steps:
+      # Each flavour's test and Jacoco reports, uploaded as the run's reports artifact. In the
+      # runner's temp folder: upload-artifact rejects a path with "..", and the job's env: can't
+      # use the runner context, hence this step.
+      - name: Set the reports folder
+        run: echo "REPORTS=$RUNNER_TEMP/reports" >> "$GITHUB_ENV"
+
       # Unifies pull_request and issue_comment ("build-it" PR-comment retrigger)
       # events behind one set of outputs, so every step below branches on
       # steps.pr_context.outputs.is_pr instead of re-deriving PR context per event
@@ -340,8 +344,19 @@ jobs:
           [ "$ANY_FAILED" = false ]
 
       # UI tests (opt-in, run_ui_tests): one emulator for every flavour, after a successful
-      # build. The emulator needs KVM, which standard ubuntu-latest runners have but don't
-      # open to the runner user by default.
+      # build. After the build the runner has only ~3.5 GB free, too little for the emulator's
+      # data partition (0.15.0's first run: "Not enough space to create userdata partition"), so
+      # remove preinstalled toolchains the job never uses (.NET, Haskell, CodeQL, Boost; not
+      # the Android SDK or the JDKs).
+      - name: Free disk space for the emulator
+        if: inputs.run_ui_tests && steps.build.outcome == 'success'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      # The emulator needs KVM, which standard ubuntu-latest runners have but don't open to the
+      # runner user by default.
       - name: Enable KVM for the emulator
         if: inputs.run_ui_tests && steps.build.outcome == 'success'
         run: |
@@ -472,6 +487,10 @@ jobs:
           api-level: ${{ inputs.ui_test_api_level }}
           target: google_apis
           arch: x86_64
+          # The standard runner's 4 cores (the emulator's default is 2), and a 3 GB data
+          # partition instead of the image's ~7.4 GB default: plenty for the app and its tests.
+          cores: 4
+          disk-size: 3G
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           script: bash "$RUNNER_TEMP/ui-tests.sh"
