@@ -214,10 +214,9 @@ this workflow passes those explicitly for the actual release build). There's no
 `version.properties` to keep in sync across branches:
 
 - **The next version** comes from the latest reachable `X.Y.Z` tag plus the release
-  PR's declared bump type - see `## Version Bump` in `AgeCalculator`'s
-  `.github/PULL_REQUEST_TEMPLATE/release.md` (`major`/`minor`/`patch`, default
-  `patch`), extracted the same way `## Release Notes` is. With no tag yet at all,
-  the first release is always `1.0.0`.
+  PR's declared bump type - see `## Version Bump` in the release PR template
+  (`major`/`minor`/`patch`, default `patch`; below), extracted the same way
+  `## Release Notes` is. With no tag yet at all, the first release is always `1.0.0`.
 - **versionCode** is the calling repo's total commit count (`git rev-list --count`) -
   deterministic from any commit, so `promote-to-production` can reproduce the exact
   same number later purely from a tag, without needing to persist it anywhere.
@@ -227,6 +226,20 @@ this workflow passes those explicitly for the actual release build). There's no
 
 Requires `fetch-depth: 0` on checkout (already set in this workflow) - a shallow
 checkout can't see the tags or full commit history this depends on.
+
+**PR templates:** the canonical copies are `templates/PULL_REQUEST_TEMPLATE/default.md`
+(feature PRs into `develop`) and `release.md` (release PRs into `main`) in this repo,
+versioned with it (each release tag holds the templates as released). GitHub only shows
+a PR template from the repo the PR is opened in, so each app repo keeps identical copies
+in `.github/PULL_REQUEST_TEMPLATE/` (`release.md` opened with `?template=release.md`) and
+updates them from here when it moves to a new build-tools version. `default.md` is
+generic: an app with product flavours adds a `## Flavours` section after Test plan, with
+one `- [ ] Build <flavour>` box per flavour (what its caller's flavour picker reads); the
+Distribution box (`Upload debug APK to Firebase`) is unticked by default.
+`release.md` carries the
+sections this workflow reads (`## Version Bump`, `## Release Notes`, kept last) and the
+"UI tests on device" line: CI runs no instrumented tests, so every release PR records a
+full run of every flavour on a connected device, from `develop` as merged.
 
 ### `cd-production-promote.yml` (reusable)
 
