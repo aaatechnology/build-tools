@@ -182,3 +182,24 @@ jobs:
             fi
           } > "$RUNNER_TEMP/comment.md"
           gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body-file "$RUNNER_TEMP/comment.md"
+
+      # The merged PR's branch is done with: delete it, whatever the release did (a re-run
+      # works from main, not the branch). Only this repo's own branches, never main, and a
+      # branch that's already gone isn't an error.
+      - name: Delete the merged branch
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Chosen by whoever opened the PR, so it's only ever read from the environment.
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          if [ "$HEAD_REPO" != "${{ github.repository }}" ] || [ "$HEAD_REF" = main ]; then
+            echo "Not deleting $HEAD_REPO:$HEAD_REF (another repo's branch, or main)."
+            exit 0
+          fi
+          if gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/$HEAD_REF" > /dev/null 2>&1; then
+            echo "Deleted $HEAD_REF."
+          else
+            echo "$HEAD_REF wasn't deleted (already gone?)."
+          fi
