@@ -9,6 +9,15 @@
 # (>= 0.14.0), and an app without flavours has one, named "default". A flavour is only
 # promoted when its newest Internal Testing versionCode is higher than Production's - one
 # already in Production is reported and left alone.
+#
+# Release notes doc (optional, `release_notes_doc`): once the release is published, a section
+# for the tag goes into that file on `release_notes_branch` (develop by default, committed
+# straight to it, so it reaches main with the next release; a push to main would start another
+# release), and the GitHub release gets a link to that section. The doc has a table (version,
+# date, tag, notes) and one section per version: the release's notes (the release PR's
+# `## Release Notes`) and the PRs merged since the previous tag. A version already in the doc
+# is left alone, so promoting the same tag again (a staged rollout raised, another flavour)
+# adds nothing.
 
 name: Android Promote to Production (reusable)
 
@@ -29,6 +38,21 @@ on:
         description: 'Percent of users to roll out to (1-100). Less than 100 starts a staged rollout.'
         required: true
         type: string
+      release_notes_doc:
+        description: 'Release notes document to add each published release to, e.g. docs/RELEASE_NOTES.md (empty: off)'
+        required: false
+        type: string
+        default: ''
+      release_notes_branch:
+        description: 'Branch the release notes document is committed to'
+        required: false
+        type: string
+        default: 'develop'
+      app_display_name:
+        description: 'App name for the release notes document title (empty: "Release notes")'
+        required: false
+        type: string
+        default: ''
     secrets:
       play_service_account_json:
         required: true
@@ -174,6 +198,8 @@ jobs:
           SUMMARY=""
           PROMOTED_ANY=false
           FAILED=false
+          PROMOTED_CODE=""
+          PROMOTED_FLAVORS=""
           for FLAVOR in $APP_FLAVORS; do
             PACKAGE="$(var "$FLAVOR" APPLICATION_ID)"
             LABEL="$PACKAGE"
@@ -200,6 +226,8 @@ jobs:
                 "${ROLLOUT_ARGS[@]}"; then
               SUMMARY+="- ✅ $LABEL: version code $INTERNAL promoted to Production ($ROLLOUT_PCT% rollout)"$'\n'
               PROMOTED_ANY=true
+              PROMOTED_CODE="$INTERNAL"
+              PROMOTED_FLAVORS+="${PROMOTED_FLAVORS:+, }$FLAVOR"
             else
               SUMMARY+="- ❌ $LABEL: promotion failed - check the workflow run"$'\n'
               FAILED=true
@@ -213,8 +241,12 @@ jobs:
             printf '%s' "$SUMMARY"
             echo "SUMMARY_EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "PROMOTED_ANY=$PROMOTED_ANY" >> "$GITHUB_ENV"
-          echo "PROMOTE_FAILED=$FAILED" >> "$GITHUB_ENV"
+          {
+            echo "PROMOTED_ANY=$PROMOTED_ANY"
+            echo "PROMOTE_FAILED=$FAILED"
+            echo "PROMOTED_CODE=$PROMOTED_CODE"
+            echo "PROMOTED_FLAVORS=$PROMOTED_FLAVORS"
+          } >> "$GITHUB_ENV"
 
       - name: Remove Play service account key
         if: always()
@@ -226,6 +258,129 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" --draft=false
+
+      # Adds the published release to the release notes document (see the header) and links the
+      # GitHub release to its section, at the commit that added it (main gets the doc only with
+      # the next release). A failure here is reported but doesn't fail the promotion, which has
+      # already happened.
+      - name: Add the release to the release notes document
+        if: env.PROMOTED_ANY == 'true' && inputs.release_notes_doc != ''
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DOC: ${{ inputs.release_notes_doc }}
+          BRANCH: ${{ inputs.release_notes_branch }}
+          APP_NAME: ${{ inputs.app_display_name }}
+        run: |
+          set -euo pipefail
+          LINK_PREFIX="📝 Release notes:"
+          TAG_SHA=$(git rev-list -n 1 "$RELEASE_TAG")
+          PREV_TAG=$(git describe --tags --abbrev=0 --match "[0-9]*.[0-9]*.[0-9]*" "$RELEASE_TAG^" 2>/dev/null || true)
+
+          # The release's own notes, without a link line from an earlier run.
+          gh release view "$RELEASE_TAG" --repo "$REPO" --json body --jq .body \
+            | grep -v "^$LINK_PREFIX" > "$RUNNER_TEMP/notes.md" || true
+          RELEASE_PR=$(gh api "repos/$REPO/commits/$TAG_SHA/pulls" --jq '[.[] | select(.base.ref == "main")][0].number // empty' || true)
+
+          # PRs merged since the previous tag, except release PRs (into main) and back-merges.
+          : > "$RUNNER_TEMP/prs.md"
+          RANGE="$RELEASE_TAG"
+          [ -n "$PREV_TAG" ] && RANGE="$PREV_TAG..$RELEASE_TAG"
+          for N in $(git log --merges --format=%s "$RANGE" | sed -n 's/^Merge pull request #\([0-9]*\) .*/\1/p' | sort -rn | uniq); do
+            PR=$(gh pr view "$N" --repo "$REPO" --json title,baseRefName --jq '[.baseRefName, .title] | @tsv' || true)
+            BASE=${PR%%$'\t'*}
+            TITLE=${PR#*$'\t'}
+            [ -n "$PR" ] && [ "$BASE" != "main" ] && echo "- #$N $TITLE" >> "$RUNNER_TEMP/prs.md"
+          done
+
+          # Edit the doc on the branch in a separate worktree.
+          WORKTREE="$RUNNER_TEMP/release-notes"
+          git fetch -q origin "$BRANCH"
+          git worktree add -q -B release-notes-update "$WORKTREE" "origin/$BRANCH"
+          cd "$WORKTREE"
+          mkdir -p "$(dirname "$DOC")"
+
+          export RELEASE_PR PREV_TAG
+          cat > "$RUNNER_TEMP/release_notes_doc.py" <<'PYEOF'
+          import datetime, os, re, sys
+
+          doc = sys.argv[1]
+          env = os.environ
+          tag, repo = env["RELEASE_TAG"], env["REPO"]
+          # GitHub's heading anchor: lower case, punctuation other than - and _ removed, spaces to -.
+          anchor = re.sub(r"[^a-z0-9 _-]", "", tag.lower()).replace(" ", "-")
+          date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+          read = lambda name: open(os.path.join(env["RUNNER_TEMP"], name)).read().strip()
+          notes, prs = read("notes.md"), read("prs.md")
+          # Play-style "•" lines would run together as one markdown paragraph: make them list items.
+          notes = re.sub(r"^\s*[•·]\s*", "- ", notes, flags=re.M)
+
+          name = env.get("APP_NAME", "").strip()
+          title = f"# {name} release notes" if name else "# Release notes"
+          intro = ("Each release's notes, newest first. Added by the release workflow when a release is "
+                   "published; the GitHub release for that tag links to its section.")
+          table_head = "| Version | Date | Tag | Notes |\n|---|---|---|---|"
+
+          top, rows, sections = f"{title}\n\n{intro}", [], ""
+          if os.path.exists(doc):
+              text = open(doc).read()
+              if re.search(r"^## " + re.escape(tag) + r"\s*$", text, re.M):
+                  print("exists")
+                  sys.exit(0)
+              table = re.search(r"^\| Version \|.*\n\|[-| ]+\|\n((?:\|.*\|\n?)*)", text, re.M)
+              if table:
+                  top = text[:table.start()].rstrip()
+                  rows = [r for r in table.group(1).splitlines() if r.strip()]
+              first = re.search(r"^## ", text, re.M)
+              sections = text[first.start():].rstrip() if first else ""
+
+          release_url = f"https://github.com/{repo}/releases/tag/{tag}"
+          row = f"| {tag} | {date} | [{tag}]({release_url}) | [{tag}](#{anchor}) |"
+          flavors = env.get("PROMOTED_FLAVORS", "")
+          flavors = "" if flavors in ("", "default") else flavors.replace(", ", " and ")
+          code = env.get("PROMOTED_CODE", "")
+          released = " · ".join(x for x in [date, f"versionCode {code}" if code else "", flavors] if x)
+          links = [f"[GitHub release]({release_url})"]
+          if env.get("RELEASE_PR"):
+              pr = env["RELEASE_PR"]
+              links.append(f"[Release PR #{pr}](https://github.com/{repo}/pull/{pr})")
+          if env.get("PREV_TAG"):
+              prev = env["PREV_TAG"]
+              links.append(f"[Changes since {prev}](https://github.com/{repo}/compare/{prev}...{tag})")
+
+          section = (f"## {tag}\n\n- **Released:** {released}\n- **Links:** {' · '.join(links)}\n\n"
+                     f"### What's new\n\n{notes or '-'}\n")
+          if prs:
+              section += f"\n### Pull requests\n\n{prs}\n"
+
+          out = f"{top}\n\n{table_head}\n" + "\n".join([row] + rows) + f"\n\n{section}"
+          if sections:
+              out += f"\n{sections}\n"
+          open(doc, "w").write(out)
+          print(anchor)
+          PYEOF
+          RESULT=$(python3 "$RUNNER_TEMP/release_notes_doc.py" "$DOC")
+          if [ "$RESULT" = "exists" ]; then
+            echo "$RELEASE_TAG is already in $DOC; nothing to add."
+            exit 0
+          fi
+
+          git add "$DOC"
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "Release notes for $RELEASE_TAG"
+          # The branch may move on meanwhile: rebase and try again.
+          for TRY in 1 2 3; do
+            git push -q origin "HEAD:$BRANCH" && break
+            [ "$TRY" = 3 ] && { echo "::error::Couldn't push the release notes to $BRANCH"; exit 1; }
+            git fetch -q origin "$BRANCH" && git rebase -q "origin/$BRANCH"
+          done
+
+          LINK="https://github.com/$REPO/blob/$(git rev-parse HEAD)/$DOC#$RESULT"
+          printf '%s\n\n%s %s\n' "$(cat "$RUNNER_TEMP/notes.md")" "$LINK_PREFIX" "$LINK" > "$RUNNER_TEMP/body.md"
+          gh release edit "$RELEASE_TAG" --repo "$REPO" --notes-file "$RUNNER_TEMP/body.md"
+          echo "Added $RELEASE_TAG to $DOC on $BRANCH: $LINK" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Fail if any flavour's promotion failed
         if: env.PROMOTE_FAILED == 'true'

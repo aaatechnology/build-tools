@@ -258,6 +258,22 @@ tag when run from `main` directly - then recomputes that tag's versionCode via
 `git rev-list --count <tag>`, reproducing exactly what was used when that release was
 built. Also needs `fetch-depth: 0` (already set) for the same reason as above.
 
+**Release notes document (optional, `release_notes_doc`).** Set it to a path such as
+`docs/RELEASE_NOTES.md` and, once the release is published, the tag gets a section in that
+file, committed straight to `release_notes_branch` (`develop` by default; not `main`, where a
+push would start another Internal Testing release, so `main` gets the doc with the next
+release). The doc opens with a table (version, date, tag link to the GitHub release, link to
+the version's section), then one section per version, newest first: the date, versionCode and
+flavours, links to the GitHub release, the release PR and the changes since the previous tag,
+the release's notes (the release PR's `## Release Notes`) and the PRs merged since the previous
+tag (release PRs into `main` and back-merges left out). The file is created on the first
+release; `app_display_name` names it ("File Manager release notes"). The GitHub release then
+gets a `📝 Release notes:` link to that section, at the commit that added it. A version already
+in the doc is left alone, so promoting the same tag again (a staged rollout raised, another
+flavour) adds nothing. Doing it at promotion, not at Internal Testing, keeps drafts (and a
+`same` re-release, which builds Play's notes from the draft's) free of the link. A failure here
+is reported in the step but doesn't fail the promotion.
+
 ```yaml
 name: CD - Promote to Production
 
@@ -291,6 +307,9 @@ jobs:
     with:
       flavors: ${{ inputs.flavors || 'all' }}
       rollout_percentage: ${{ inputs.rollout_percentage }}
+      # Optional: add each published release to a release notes document on develop.
+      # release_notes_doc: docs/RELEASE_NOTES.md
+      # app_display_name: My App
     secrets: inherit
 ```
 
