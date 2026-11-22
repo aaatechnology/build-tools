@@ -375,25 +375,32 @@ tasks.register<JacocoReport>("uiTestJacocoReport") {
     executionData.setFrom(files(modules.map { moduleUiTestExecData(it) }))
 }
 
-// Writes every subproject's name, one per line, to a file CI can just `cat` -
-// the actual live Gradle project model, not a text-parsed guess at
-// settings.gradle.kts's include(...) syntax (which varies: one include() per
-// module vs one call listing several, Kotlin DSL vs Groovy, dynamic inclusion,
-// etc.). This is what tells CI's coverage step how many modules exist, so it
-// knows whether to print a per-module breakdown at all.
+// Writes every module's directory, relative to the root project (one per line), to a
+// file CI can just `cat` - the actual live Gradle project model, not a text-parsed
+// guess at settings.gradle.kts's include(...) syntax (which varies: one include() per
+// module vs one call listing several, Kotlin DSL vs Groovy, dynamic inclusion, etc.).
+// This is what tells CI's coverage step how many modules exist (so it knows whether
+// to print a per-module breakdown at all) and where each one's moduleJacocoReport is:
+// CI reads `<line>/build/reports/jacoco/...`. A path, not project.name, so nested
+// modules work (`:core:security` -> `core/security`, not `security`); for modules
+// directly under the root the two are the same. Projects with no build file are left
+// out: those are only folders grouping modules (`:core` for `:core:security`).
 tasks.register("listCoverageModules") {
     group = "verification"
-    description = "Writes every subproject name (one per line) for CI's coverage breakdown to read."
+    description = "Writes every module's directory (one per line) for CI's coverage breakdown to read."
 
     val outputFile = layout.buildDirectory.file("coverage-modules.txt")
     // Captured at configuration time, not read from `project`/`rootProject`
     // inside doLast - the latter is unsupported under the configuration cache
     // (Task.project can't be invoked at execution time).
-    val moduleNames = project.rootProject.subprojects.map { it.name }
+    val rootDir = project.rootProject.projectDir
+    val moduleDirs = project.rootProject.subprojects
+        .filter { module -> listOf("build.gradle.kts", "build.gradle").any { File(module.projectDir, it).isFile } }
+        .map { it.projectDir.relativeTo(rootDir).invariantSeparatorsPath }
     outputs.file(outputFile)
 
     doLast {
-        outputFile.get().asFile.writeText(moduleNames.joinToString("\n"))
+        outputFile.get().asFile.writeText(moduleDirs.joinToString("\n"))
     }
 }
 
