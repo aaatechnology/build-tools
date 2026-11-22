@@ -34,7 +34,7 @@ on:
         type: string
         default: 'android-testers'
       play_internal_testing_link:
-        description: 'Link to the Play Store Internal Testing opt-in page, posted in the PR comment on success'
+        description: 'Link to the Play Store Internal Testing opt-in page, posted in the PR comment on success and in the Firebase release notes'
         required: false
         type: string
         default: ''
@@ -457,6 +457,7 @@ jobs:
           FALLBACK_APP_ID: ${{ secrets.firebase_app_id }}
           GROUP: ${{ inputs.firebase_testers_group }}
           DISPLAY_NAME: ${{ inputs.app_display_name }}
+          PLAY_LINK: ${{ inputs.play_internal_testing_link }}
         run: |
           var() {
             local key
@@ -485,6 +486,10 @@ jobs:
 
             LABEL="$DISPLAY_NAME"
             [ "$FLAVOR" != "default" ] && LABEL="$DISPLAY_NAME ($FLAVOR)"
+            # The Play opt-in link, when the caller passes one, so testers can open it
+            # from the Firebase App Tester app.
+            DETAILS="- Version: $RELEASE_TAG, Version Code: $VERSION_CODE"
+            [ -n "$PLAY_LINK" ] && DETAILS="$DETAILS"$'\n'"- 🔗 Play Store internal testing: $PLAY_LINK"
             cat > "$OUT/notes.txt" <<NOTES
           🚀 $LABEL $RELEASE_TAG (Release)
 
@@ -493,7 +498,7 @@ jobs:
           Store propagation.
 
           📋 Build Details:
-          - Version: $RELEASE_TAG, Version Code: $VERSION_CODE
+          $DETAILS
 
           📝 Release Notes:
           $RELEASE_NOTES
