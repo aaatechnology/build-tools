@@ -198,7 +198,8 @@ Required secrets on the calling repo: `ANDROID_KEYSTORE_BASE64`,
 (`FIREBASE_APP_ID` only as the single-flavour fallback).
 `play_internal_testing_link` is optional (an org/repo variable, not a secret) -
 omit the `with:` line entirely if you don't have one, rather than passing an empty
-string.
+string. When set, it's posted in the release PR comment and (from 0.17.0) in the
+Firebase App Distribution release notes, so testers can open it from the App Tester app.
 
 All selected flavours ship as one version (one tag, one draft GitHub release with each
 flavour's AAB and mapping file). The tag and release are only created once **every**
